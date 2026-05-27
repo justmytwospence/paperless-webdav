@@ -296,9 +296,17 @@ class PaperlessClient:
         # Paperless's StandardPagination defaults to 25 per page but accepts
         # page_size up to 100000 via query string. Requesting 200 collapses
         # a typical ~130-doc share's listing from 6 sequential paginated
-        # round trips into 1, dropping cold PROPFIND latency proportionally.
+        # round trips into 1. The `fields=` sparse-fieldset is the bigger
+        # lever though: the default DocumentSerializer includes the full
+        # OCR `content` (tens of KB per doc), so a 200-row response is
+        # tens of MB. Asking for just the fields we need (the PaperlessDocument
+        # constructor's required attrs) drops the payload from ~48 MB to
+        # ~36 KB on a 132-doc share, and the query time from ~4.5 s to ~1 s.
         # Shares larger than 200 docs still paginate.
-        params: dict[str, Any] = {"page_size": 200}
+        params: dict[str, Any] = {
+            "page_size": 200,
+            "fields": "id,title,original_file_name,created,modified,tags",
+        }
 
         if include_tag_ids:
             params["tags__id__all"] = ",".join(str(tid) for tid in include_tag_ids)
