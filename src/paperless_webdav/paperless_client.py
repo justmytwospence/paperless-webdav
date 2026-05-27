@@ -293,7 +293,12 @@ class PaperlessClient:
         Returns:
             List of PaperlessDocument objects
         """
-        params: dict[str, Any] = {}
+        # Paperless's StandardPagination defaults to 25 per page but accepts
+        # page_size up to 100000 via query string. Requesting 200 collapses
+        # a typical ~130-doc share's listing from 6 sequential paginated
+        # round trips into 1, dropping cold PROPFIND latency proportionally.
+        # Shares larger than 200 docs still paginate.
+        params: dict[str, Any] = {"page_size": 200}
 
         if include_tag_ids:
             params["tags__id__all"] = ",".join(str(tid) for tid in include_tag_ids)
@@ -303,7 +308,7 @@ class PaperlessClient:
 
         results = await self._paginated_get(
             "/api/documents/",
-            params=params if params else None,
+            params=params,
         )
 
         documents = [
