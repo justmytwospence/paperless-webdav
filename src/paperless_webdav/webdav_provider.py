@@ -31,6 +31,60 @@ from paperless_webdav.paperless_client import PaperlessClient, PaperlessDocument
 DocumentList = list[PaperlessDocument]
 
 
+def _document_list_cache_key(
+    environ: dict[str, Any],
+    namespace: str,
+    include_tag_ids: list[int],
+    exclude_tag_ids: list[int],
+) -> str:
+    """Build the cache key for a tag-filtered document list.
+
+    Namespacing by token means one user's invalidation doesn't pollute
+    another's view; namespacing by share+role keeps the share root and
+    its done folder as separate entries.
+    """
+    token = environ.get("paperless.token", "")
+    token_key = token[:16] if len(token) >= 16 else token
+    inc = ",".join(str(i) for i in sorted(include_tag_ids))
+    exc = ",".join(str(i) for i in sorted(exclude_tag_ids))
+    return f"{token_key}:{namespace}:{inc}:{exc}"
+
+
+def _load_documents_cached(
+    client: PaperlessClient,
+    environ: dict[str, Any],
+    namespace: str,
+    include_tag_ids: list[int],
+    exclude_tag_ids: list[int],
+) -> DocumentList:
+    """Fetch the tag-filtered document list, consulting the document-list cache.
+
+    Without this cache every WebDAV request that resolves a path under a
+    share (PROPFIND, GET, HEAD, PUT, MOVE, ...) re-paginates the whole
+    document list from Paperless. For a ~130-doc share that is ~12 s of
+    sequential page fetches on every request -- the dominant cost in
+    GET TTFB once the size prefetch is in place.
+    """
+    from dataclasses import asdict as _asdict
+
+    cache = get_cache()
+    cache_key = _document_list_cache_key(environ, namespace, include_tag_ids, exclude_tag_ids)
+    cached = cache.get_document_list(cache_key)
+    if cached is not None:
+        logger.debug("documents_cache_hit", namespace=namespace, count=len(cached))
+        return [PaperlessDocument(**doc) for doc in cached]
+
+    documents = run_async(
+        client.get_documents(
+            include_tag_ids=include_tag_ids,
+            exclude_tag_ids=exclude_tag_ids,
+        )
+    )
+    cache.set_document_list(cache_key, [_asdict(d) for d in documents])
+    logger.debug("documents_cache_miss", namespace=namespace, count=len(documents))
+    return documents
+
+
 def prefetch_document_sizes(client: PaperlessClient, documents: DocumentList) -> None:
     """Pre-fetch and cache sizes for all documents concurrently.
 
@@ -535,12 +589,13 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
                 done_tag_ids = self._resolve_tag_ids_from_map(tag_map, [self._share.done_tag])
                 exclude_tag_ids.extend(done_tag_ids)
 
-            # Fetch documents with tag filters
-            documents = run_async(
-                client.get_documents(
-                    include_tag_ids=include_tag_ids,
-                    exclude_tag_ids=exclude_tag_ids,
-                )
+            # Fetch documents with tag filters (cached per share+filter combo)
+            documents = _load_documents_cached(
+                client,
+                self.environ,
+                namespace=f"{self._share.name}:root",
+                include_tag_ids=include_tag_ids,
+                exclude_tag_ids=exclude_tag_ids,
             )
             logger.debug(
                 "loaded_documents_dynamically",
@@ -813,12 +868,13 @@ class DoneFolderResource(DAVCollection):  # type: ignore[misc]
                 tag_map, list(self._share.exclude_tags)
             )
 
-            # Fetch documents with tag filters
-            documents = run_async(
-                client.get_documents(
-                    include_tag_ids=include_tag_ids,
-                    exclude_tag_ids=exclude_tag_ids,
-                )
+            # Fetch documents with tag filters (cached per share+filter combo)
+            documents = _load_documents_cached(
+                client,
+                self.environ,
+                namespace=f"{self._share.name}:done",
+                include_tag_ids=include_tag_ids,
+                exclude_tag_ids=exclude_tag_ids,
             )
             logger.debug(
                 "loaded_done_documents",

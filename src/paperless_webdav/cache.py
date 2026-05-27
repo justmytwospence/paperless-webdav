@@ -21,6 +21,7 @@ logger = get_logger(__name__)
 CONTENT_TTL = 300  # 5 minutes for document content
 SIZE_TTL = 300  # 5 minutes for sizes (same as content for consistency)
 TAG_MAP_TTL = 300  # 5 minutes for tag mappings
+DOCUMENT_LIST_TTL = 300  # 5 minutes for per-share document listings
 
 
 class CacheBackend(Protocol):
@@ -33,6 +34,10 @@ class CacheBackend(Protocol):
     def get_tag_map(self, token: str) -> dict[str, int] | None: ...
     def set_tag_map(
         self, token: str, tag_map: dict[str, int], ttl: float | None = None
+    ) -> None: ...
+    def get_document_list(self, key: str) -> list[dict[str, Any]] | None: ...
+    def set_document_list(
+        self, key: str, documents: list[dict[str, Any]], ttl: float | None = None
     ) -> None: ...
     def invalidate_content(self, document_id: int) -> None: ...
     def clear(self) -> None: ...
@@ -53,6 +58,7 @@ class InMemoryCache:
         self._content_cache: dict[int, CacheEntry] = {}
         self._size_cache: dict[int, CacheEntry] = {}
         self._tag_map_cache: dict[str, CacheEntry] = {}
+        self._document_list_cache: dict[str, CacheEntry] = {}
         self._lock = Lock()
 
     def get_content(self, document_id: int) -> bytes | None:
@@ -127,6 +133,29 @@ class InMemoryCache:
             )
         logger.debug("cache_set_tag_map", tag_count=len(tag_map), backend="memory")
 
+    def get_document_list(self, key: str) -> list[dict[str, Any]] | None:
+        with self._lock:
+            entry = self._document_list_cache.get(key)
+            if entry is None:
+                return None
+            if time.time() > entry.expires_at:
+                del self._document_list_cache[key]
+                return None
+            logger.debug("cache_hit_document_list", key=key, backend="memory")
+            return entry.value
+
+    def set_document_list(
+        self, key: str, documents: list[dict[str, Any]], ttl: float | None = None
+    ) -> None:
+        if ttl is None:
+            ttl = DOCUMENT_LIST_TTL
+        with self._lock:
+            self._document_list_cache[key] = CacheEntry(
+                value=documents,
+                expires_at=time.time() + ttl,
+            )
+        logger.debug("cache_set_document_list", key=key, count=len(documents), backend="memory")
+
     def invalidate_content(self, document_id: int) -> None:
         with self._lock:
             self._content_cache.pop(document_id, None)
@@ -138,6 +167,7 @@ class InMemoryCache:
             self._content_cache.clear()
             self._size_cache.clear()
             self._tag_map_cache.clear()
+            self._document_list_cache.clear()
         logger.info("cache_cleared", backend="memory")
 
 
@@ -175,6 +205,9 @@ class RedisCache:
     def _tag_map_key(self, token: str) -> str:
         cache_key = token[:16] if len(token) >= 16 else token
         return f"{self._prefix}tagmap:{cache_key}"
+
+    def _document_list_key(self, key: str) -> str:
+        return f"{self._prefix}doclist:{key}"
 
     def get_content(self, document_id: int) -> bytes | None:
         try:
@@ -240,6 +273,30 @@ class RedisCache:
             logger.debug("cache_set_tag_map", tag_count=len(tag_map), backend="redis")
         except Exception as e:
             logger.warning("redis_cache_error", operation="set_tag_map", error=str(e))
+
+    def get_document_list(self, key: str) -> list[dict[str, Any]] | None:
+        try:
+            data = self._redis.get(self._document_list_key(key))
+            if data is not None:
+                logger.debug("cache_hit_document_list", key=key, backend="redis")
+                return json.loads(data.decode())
+            return None
+        except Exception as e:
+            logger.warning("redis_cache_error", operation="get_document_list", error=str(e))
+            return None
+
+    def set_document_list(
+        self, key: str, documents: list[dict[str, Any]], ttl: float | None = None
+    ) -> None:
+        if ttl is None:
+            ttl = DOCUMENT_LIST_TTL
+        try:
+            self._redis.setex(
+                self._document_list_key(key), int(ttl), json.dumps(documents).encode()
+            )
+            logger.debug("cache_set_document_list", key=key, count=len(documents), backend="redis")
+        except Exception as e:
+            logger.warning("redis_cache_error", operation="set_document_list", error=str(e))
 
     def invalidate_content(self, document_id: int) -> None:
         try:

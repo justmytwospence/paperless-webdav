@@ -872,6 +872,37 @@ class TestDynamicDocumentLoading:
         call_args = mock_paperless_client.get_documents.call_args
         assert 1 in call_args.kwargs.get("include_tag_ids", [])
 
+    def test_document_list_is_cached_across_requests(
+        self,
+        mock_environ_with_token: dict[str, Any],
+        mock_share: MagicMock,
+        mock_paperless_client: AsyncMock,
+        sample_documents: list[PaperlessDocument],
+    ) -> None:
+        """Two consecutive ShareResource listings within the cache TTL must
+        hit Paperless's paginated /api/documents/ endpoint only once.
+
+        Without this caching, every WebDAV path resolution (PROPFIND, GET,
+        HEAD, ...) re-paginates the full doc list, which on a ~130-doc share
+        is ~12 s sequentially -- the dominant cost in GET TTFB.
+        """
+        mock_paperless_client.get_documents.return_value = sample_documents
+
+        shares: dict[str, Any] = {"tax2025": mock_share}
+        provider = PaperlessProvider(
+            shares=shares,
+            paperless_url="http://paperless.local",
+        )
+
+        with patch.object(provider, "_create_client", return_value=mock_paperless_client):
+            first = ShareResource("/tax2025", mock_environ_with_token, provider, mock_share)
+            first_names = first.get_member_names()
+            second = ShareResource("/tax2025", mock_environ_with_token, provider, mock_share)
+            second_names = second.get_member_names()
+
+        assert first_names == second_names
+        assert mock_paperless_client.get_documents.call_count == 1
+
 
 class TestDocumentContentDownload:
     """Tests for document content download from Paperless API."""
