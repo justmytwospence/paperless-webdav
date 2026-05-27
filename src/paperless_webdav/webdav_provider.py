@@ -1002,77 +1002,16 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         """
         return "application/pdf"
 
-    def _download_content(self) -> bytes:
-        """Download document content from Paperless API.
-
-        Uses a global cache to avoid re-downloading the same document.
-        Also verifies and updates the size cache to ensure Content-Length
-        consistency (HEAD requests may return different sizes than GET).
-
-        Returns:
-            Document content as bytes, or empty bytes on error
-        """
-        if self._content is not None:
-            return self._content
-
-        # Check global cache first
-        cache = get_cache()
-        cached_content = cache.get_content(self.document.id)
-        if cached_content is not None:
-            self._content = cached_content
-            return self._content
-
-        client = self._provider._create_client(self.environ)
-        if client is not None:
-            try:
-                self._content = run_async(client.download_document(self.document.id))
-                actual_size = len(self._content)
-
-                # Check if cached size differs from actual size. With the
-                # metadata-endpoint size prefetch in place, this is now rare and
-                # logged at debug rather than warn so a normal listing isn't
-                # noisy.
-                cached_size = cache.get_size(self.document.id)
-                if cached_size is not None and cached_size != actual_size:
-                    logger.debug(
-                        "size_mismatch_corrected",
-                        document_id=self.document.id,
-                        cached_size=cached_size,
-                        actual_size=actual_size,
-                    )
-
-                # Store in global cache (this also updates size cache)
-                cache.set_content(self.document.id, self._content)
-                logger.debug(
-                    "downloaded_document_content",
-                    document_id=self.document.id,
-                    size=actual_size,
-                )
-                return self._content
-            except Exception as exc:
-                logger.error(
-                    "download_document_failed",
-                    document_id=self.document.id,
-                    error=str(exc),
-                )
-                self._content = b""
-                return self._content
-
-        # No client available - return empty bytes
-        logger.warning(
-            "no_client_for_download",
-            document_id=self.document.id,
-        )
-        return b""
-
     def get_content_length(self) -> int | None:
         """Return the content length.
 
         Prefers, in order: already-loaded content, cached content, the size
         cache populated by prefetch_document_sizes() (queries Paperless's
-        /metadata/ endpoint for the served-variant size), then a full download
-        as a last resort. Skipping the size cache turned PROPFIND into an
-        N-document re-download on every listing -- see upstream issue #3.
+        /metadata/ endpoint for the served-variant size), and finally a
+        one-shot /metadata/ probe for this document if the cache is cold.
+        Never falls back to a full download -- the streaming get_content()
+        path handles unknown lengths cleanly, and downloading just to learn
+        the size is exactly the regression that motivated upstream issue #3.
 
         Returns:
             Content length in bytes, or None if unknown
@@ -1097,21 +1036,64 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         if cached_size is not None:
             return cached_size
 
-        # Cache miss in both layers -- download to learn the size.
-        content = self._download_content()
-        return len(content)
+        # Last-resort: single /metadata/ probe for this document. Used when
+        # get_content_length is called outside a listing context (e.g. a
+        # direct HEAD on a doc) so the size cache hasn't been warmed.
+        client = self._provider._create_client(self.environ)
+        if client is not None:
+            try:
+                size = run_async(client.get_document_size(self.document.id))
+                if size is not None:
+                    cache.set_size(self.document.id, size)
+                    return size
+            except Exception as exc:
+                logger.debug(
+                    "size_probe_failed",
+                    document_id=self.document.id,
+                    error=str(exc),
+                )
+        return None
 
-    def get_content(self) -> io.BytesIO:
-        """Return the document content as a file-like object.
+    def get_content(self) -> Any:
+        """Return the document content as a streaming file-like object.
 
-        Downloads the document content from Paperless API and returns
-        it as a BytesIO stream.
+        Streams directly from Paperless to the WebDAV client instead of
+        buffering the full archive in this process first. For 80-120 MB
+        documents this drops time-to-first-byte from 15-25 s (the buffering
+        window) to roughly a single round trip, and prevents WebDAV clients
+        with idle timeouts (e.g. Boox / okhttp) from aborting before the
+        body is ready.
+
+        Falls back to a cached body (BytesIO) when one is available, and to
+        an empty body if no Paperless client can be created -- matching the
+        previous behaviour for those edge cases.
 
         Returns:
-            File-like object containing document content
+            File-like with read(size), close(), and forward seek().
         """
-        content = self._download_content()
-        return io.BytesIO(content)
+        if self._content is not None:
+            return io.BytesIO(self._content)
+
+        cache = get_cache()
+        cached_content = cache.get_content(self.document.id)
+        if cached_content is not None:
+            self._content = cached_content
+            return io.BytesIO(cached_content)
+
+        client = self._provider._create_client(self.environ)
+        if client is None:
+            logger.warning("no_client_for_download", document_id=self.document.id)
+            return io.BytesIO(b"")
+
+        try:
+            return client.open_document_stream(self.document.id)
+        except Exception as exc:
+            logger.error(
+                "download_document_failed",
+                document_id=self.document.id,
+                error=str(exc),
+            )
+            return io.BytesIO(b"")
 
     def get_creation_date(self) -> float:
         """Return the document creation date as Unix timestamp.

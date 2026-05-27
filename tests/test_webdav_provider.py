@@ -749,8 +749,16 @@ def mock_paperless_client() -> AsyncMock:
     ]
     # Default document fetch returns empty list
     client.get_documents.return_value = []
-    # Default download returns sample PDF bytes
+    # Default download returns sample PDF bytes (used by tests that still
+    # exercise the buffered download_document path).
     client.download_document.return_value = b"%PDF-1.4 sample content"
+    # The WebDAV GET path uses open_document_stream(), which is sync and
+    # returns a file-like. BytesIO satisfies the interface wsgidav uses.
+    client.open_document_stream = MagicMock(return_value=BytesIO(b"%PDF-1.4 sample content"))
+    # Tests that exercise the cold-cache fallback in get_content_length
+    # override this; the default treats the probe as "failed" so an
+    # accidentally-uncovered cache-miss path does not silently invent a size.
+    client.get_document_size.return_value = None
     return client
 
 
@@ -868,16 +876,22 @@ class TestDynamicDocumentLoading:
 class TestDocumentContentDownload:
     """Tests for document content download from Paperless API."""
 
-    def test_document_get_content_downloads_from_client(
+    def test_document_get_content_streams_from_client(
         self,
         mock_environ_with_token: dict[str, Any],
         mock_share: MagicMock,
         sample_document: PaperlessDocument,
         mock_paperless_client: AsyncMock,
     ) -> None:
-        """DocumentResource.get_content() should download via client."""
+        """DocumentResource.get_content() streams via open_document_stream.
+
+        wsgidav reads the returned file-like in 8 KB blocks, so the body
+        must not be buffered in this process first -- doing so produces
+        multi-second TTFB on large archive PDFs and causes WebDAV clients
+        with idle timeouts to abort the request.
+        """
         expected_content = b"%PDF-1.4 actual document content here..."
-        mock_paperless_client.download_document.return_value = expected_content
+        mock_paperless_client.open_document_stream.return_value = BytesIO(expected_content)
 
         shares: dict[str, Any] = {"tax2025": mock_share}
         provider = PaperlessProvider(
@@ -894,9 +908,10 @@ class TestDocumentContentDownload:
             )
             content_stream = doc_resource.get_content()
 
-        # get_content returns a BytesIO stream
         assert content_stream.read() == expected_content
-        mock_paperless_client.download_document.assert_called_once_with(sample_document.id)
+        mock_paperless_client.open_document_stream.assert_called_once_with(sample_document.id)
+        # And critically: the buffered download path was not used.
+        mock_paperless_client.download_document.assert_not_called()
 
     def test_document_get_content_returns_stream(
         self,
@@ -907,7 +922,7 @@ class TestDocumentContentDownload:
     ) -> None:
         """DocumentResource.get_content() should return a file-like object."""
         expected_content = b"%PDF-1.4 stream content"
-        mock_paperless_client.download_document.return_value = expected_content
+        mock_paperless_client.open_document_stream.return_value = BytesIO(expected_content)
 
         shares: dict[str, Any] = {"tax2025": mock_share}
         provider = PaperlessProvider(
@@ -924,23 +939,22 @@ class TestDocumentContentDownload:
             )
             content = doc_resource.get_content()
 
-        # wsgidav expects a file-like object or bytes
-        # Check it's readable as bytes
-        if isinstance(content, BytesIO):
-            assert content.read() == expected_content
-        else:
-            assert content == expected_content
+        assert hasattr(content, "read")
+        assert content.read() == expected_content
 
-    def test_document_get_content_length_returns_actual_size(
+    def test_document_get_content_length_returns_size_from_cache(
         self,
         mock_environ_with_token: dict[str, Any],
         mock_share: MagicMock,
         sample_document: PaperlessDocument,
         mock_paperless_client: AsyncMock,
     ) -> None:
-        """DocumentResource.get_content_length() should return actual size."""
-        expected_content = b"%PDF-1.4 content of known size"
-        mock_paperless_client.download_document.return_value = expected_content
+        """When the size cache is warmed (the common case after prefetch),
+        get_content_length() returns the cached size without any I/O.
+        """
+        from paperless_webdav.cache import get_cache
+
+        get_cache().set_size(sample_document.id, 12345)
 
         shares: dict[str, Any] = {"tax2025": mock_share}
         provider = PaperlessProvider(
@@ -955,13 +969,12 @@ class TestDocumentContentDownload:
                 provider,
                 sample_document,
             )
-            # First call to get_content to load the document
-            doc_resource.get_content()
-            # Then check length
             length = doc_resource.get_content_length()
 
-        # Should be the actual size of downloaded content
-        assert length == len(expected_content)
+        assert length == 12345
+        mock_paperless_client.download_document.assert_not_called()
+        mock_paperless_client.open_document_stream.assert_not_called()
+        mock_paperless_client.get_document_size.assert_not_called()
 
     def test_get_content_length_uses_size_cache_without_downloading(
         self,
@@ -1000,19 +1013,20 @@ class TestDocumentContentDownload:
         assert length == 1515552
         mock_paperless_client.download_document.assert_not_called()
 
-    def test_get_content_length_falls_back_to_download_on_cache_miss(
+    def test_get_content_length_probes_metadata_on_cache_miss(
         self,
         mock_environ_with_token: dict[str, Any],
         mock_share: MagicMock,
         sample_document: PaperlessDocument,
         mock_paperless_client: AsyncMock,
     ) -> None:
-        """With neither cached content nor a cached size, get_content_length()
-        must still return a correct size. This is the path that runs the very
-        first time a document is listed before the prefetch can run, e.g. when
-        the size cache TTL has expired but the document is still present."""
-        expected_content = b"%PDF-1.4 body of length determined by download"
-        mock_paperless_client.download_document.return_value = expected_content
+        """On a cold size cache (e.g. direct HEAD on a document outside any
+        listing context, or after the 5-min TTL expired), get_content_length
+        must do a single /metadata/ probe rather than a full download. A
+        download just to learn the size is exactly the regression from
+        upstream issue #3.
+        """
+        mock_paperless_client.get_document_size.return_value = 987654
 
         shares: dict[str, Any] = {"tax2025": mock_share}
         provider = PaperlessProvider(
@@ -1029,8 +1043,10 @@ class TestDocumentContentDownload:
             )
             length = doc_resource.get_content_length()
 
-        assert length == len(expected_content)
-        mock_paperless_client.download_document.assert_called_once_with(sample_document.id)
+        assert length == 987654
+        mock_paperless_client.get_document_size.assert_called_once_with(sample_document.id)
+        mock_paperless_client.download_document.assert_not_called()
+        mock_paperless_client.open_document_stream.assert_not_called()
 
 
 class TestClientCreation:
@@ -2148,8 +2164,8 @@ class TestDownloadErrorHandling:
         mock_paperless_client: AsyncMock,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Download errors should be caught, logged, and return empty bytes."""
-        mock_paperless_client.download_document.side_effect = Exception("Connection timeout")
+        """Stream-open errors should be caught, logged, and return empty bytes."""
+        mock_paperless_client.open_document_stream.side_effect = Exception("Connection timeout")
 
         shares: dict[str, Any] = {"tax2025": mock_share}
         provider = PaperlessProvider(
@@ -2166,21 +2182,21 @@ class TestDownloadErrorHandling:
             )
             content_stream = doc_resource.get_content()
 
-        # Should return empty bytes
         assert content_stream.read() == b""
-        # Should have logged an error (structlog logs to stdout)
         captured = capsys.readouterr()
         assert "download_document_failed" in captured.out
 
-    def test_download_error_caches_empty_bytes(
+    def test_download_error_does_not_cache_failure(
         self,
         mock_environ_with_token: dict[str, Any],
         mock_share: MagicMock,
         sample_document: PaperlessDocument,
         mock_paperless_client: AsyncMock,
     ) -> None:
-        """After download error, subsequent calls should return cached empty bytes."""
-        mock_paperless_client.download_document.side_effect = Exception("API error")
+        """A failed stream open must not poison the cache. Subsequent reads
+        should re-attempt so a transient Paperless hiccup doesn't mask the
+        document for the rest of the 5-minute cache TTL."""
+        mock_paperless_client.open_document_stream.side_effect = Exception("API error")
 
         shares: dict[str, Any] = {"tax2025": mock_share}
         provider = PaperlessProvider(
@@ -2195,25 +2211,24 @@ class TestDownloadErrorHandling:
                 provider,
                 sample_document,
             )
-            # First call triggers download error
             doc_resource.get_content()
-            # Second call should use cached empty bytes
             content_stream = doc_resource.get_content()
 
-        # Should return empty bytes
         assert content_stream.read() == b""
-        # Download should only have been attempted once
-        assert mock_paperless_client.download_document.call_count == 1
+        assert mock_paperless_client.open_document_stream.call_count == 2
 
-    def test_content_length_is_zero_after_download_error(
+    def test_content_length_returns_none_when_probe_and_cache_both_miss(
         self,
         mock_environ_with_token: dict[str, Any],
         mock_share: MagicMock,
         sample_document: PaperlessDocument,
         mock_paperless_client: AsyncMock,
     ) -> None:
-        """Content length should be 0 after a download error."""
-        mock_paperless_client.download_document.side_effect = Exception("Network error")
+        """If the size cache is cold and the /metadata/ probe also fails or
+        returns nothing, get_content_length() returns None (rather than
+        falling back to a full download). wsgidav handles a None length by
+        omitting Content-Length / using chunked transfer."""
+        mock_paperless_client.get_document_size.return_value = None
 
         shares: dict[str, Any] = {"tax2025": mock_share}
         provider = PaperlessProvider(
@@ -2228,13 +2243,11 @@ class TestDownloadErrorHandling:
                 provider,
                 sample_document,
             )
-            # Trigger download error
-            doc_resource.get_content()
-            # Check content length
             length = doc_resource.get_content_length()
 
-        # Should be 0 (length of empty bytes)
-        assert length == 0
+        assert length is None
+        mock_paperless_client.download_document.assert_not_called()
+        mock_paperless_client.open_document_stream.assert_not_called()
 
 
 # -----------------------------------------------------------------------------

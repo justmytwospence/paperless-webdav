@@ -43,6 +43,83 @@ class PaperlessDocument:
     tags: list[int]
 
 
+class _PaperlessDocumentStream:
+    """Sync file-like wrapping an httpx streaming response.
+
+    Used by the WebDAV GET path so the document body is forwarded to the
+    client as it arrives from Paperless, rather than buffered in full.
+    Supports the subset of file-like methods wsgidav's response loop uses
+    (`read(size)`, `read()`, `close()`, and forward-only `seek(offset)`).
+    """
+
+    _CHUNK_SIZE = 64 * 1024
+
+    def __init__(self, response: "httpx.Response", client: "httpx.Client") -> None:
+        self._response = response
+        self._client = client
+        self._iterator = response.iter_bytes(chunk_size=self._CHUNK_SIZE)
+        self._buffer = bytearray()
+        self._position = 0
+        self._closed = False
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self._closed:
+            return b""
+        if size is None or size < 0:
+            for chunk in self._iterator:
+                self._buffer.extend(chunk)
+            data = bytes(self._buffer)
+            self._buffer.clear()
+            self._position += len(data)
+            return data
+        while len(self._buffer) < size:
+            try:
+                self._buffer.extend(next(self._iterator))
+            except StopIteration:
+                break
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        self._position += len(data)
+        return data
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        # wsgidav only calls seek to position the cursor at the start of a
+        # Range request. We support whence=0 (absolute) and only forward
+        # seeks -- the underlying HTTP stream cannot rewind.
+        if whence != 0:
+            raise OSError("only absolute seeks are supported on a streamed document")
+        if offset < self._position:
+            raise OSError(
+                f"cannot seek backwards on a streamed document "
+                f"(at {self._position}, requested {offset})"
+            )
+        remaining = offset - self._position
+        while remaining > 0:
+            chunk = self.read(min(remaining, self._CHUNK_SIZE))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        return self._position
+
+    def tell(self) -> int:
+        return self._position
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._response.close()
+        finally:
+            self._client.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class PaperlessClient:
     """Async client for the Paperless-ngx REST API.
 
@@ -250,6 +327,11 @@ class PaperlessClient:
     async def download_document(self, document_id: int) -> bytes:
         """Download the content of a document.
 
+        Buffers the entire archive in memory before returning. Prefer
+        `open_document_stream` for the WebDAV GET path so the body streams
+        through to the client without paying a buffer-the-whole-archive
+        latency penalty before the first byte reaches the caller.
+
         Args:
             document_id: The ID of the document to download
 
@@ -267,6 +349,32 @@ class PaperlessClient:
             content = response.content
             logger.debug("downloaded_document", document_id=document_id, size=len(content))
             return content
+
+    def open_document_stream(self, document_id: int) -> "_PaperlessDocumentStream":
+        """Open a streaming GET of a document.
+
+        Returns a sync file-like that wsgidav can read in fixed-size blocks.
+        The caller (or wsgidav, via its read loop's `finally: fileobj.close()`)
+        is responsible for calling `close()` to release the connection.
+
+        This is the streaming counterpart to `download_document` and is the
+        path the WebDAV GET handler uses. Streaming avoids the
+        buffer-everything-then-serve behaviour that produced multi-second
+        TTFB for large archive PDFs and caused WebDAV clients with idle
+        timeouts (e.g. Boox / okhttp) to abort the request.
+        """
+        url = f"{self.base_url}/api/documents/{document_id}/download/"
+        timeout = httpx.Timeout(30.0, read=300.0)
+        client = httpx.Client(timeout=timeout)
+        try:
+            request = client.build_request("GET", url, headers=self._headers)
+            response = client.send(request, stream=True)
+            response.raise_for_status()
+        except Exception:
+            client.close()
+            raise
+        logger.debug("streaming_document_started", document_id=document_id)
+        return _PaperlessDocumentStream(response=response, client=client)
 
     @staticmethod
     def _served_size_from_metadata(metadata: dict[str, Any]) -> int | None:
