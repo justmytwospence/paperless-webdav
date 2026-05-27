@@ -206,6 +206,8 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
         documents_by_share: dict[str, list[PaperlessDocument]] | None = None,
         paperless_url: str | None = None,
         share_loader: Callable[[], dict[str, Any]] | None = None,
+        stream_downloads: bool = False,
+        document_list_ttl: int = 0,
     ) -> None:
         """Initialize the provider.
 
@@ -216,12 +218,19 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
             paperless_url: Base URL of the Paperless-ngx instance for dynamic
                 document loading
             share_loader: Callable that returns dict of share configs (for dynamic loading)
+            stream_downloads: When True, GETs stream from Paperless without
+                buffering the archive. Skips the in-memory content cache.
+                Default False preserves the legacy buffered+cached behaviour.
+            document_list_ttl: Seconds to cache per-share document listings.
+                0 disables the cache (every request paginates from Paperless).
         """
         super().__init__()
         self._shares: dict[str, Share] = shares or {}
         self._documents_by_share: dict[str, list[PaperlessDocument]] = documents_by_share or {}
         self._paperless_url: str | None = paperless_url
         self._share_loader: Callable[[], dict[str, Any]] | None = share_loader
+        self._stream_downloads: bool = stream_downloads
+        self._document_list_ttl: int = document_list_ttl
         # Build filename-to-document mapping for each share (static mode)
         self._doc_by_filename: dict[str, dict[str, PaperlessDocument]] = {}
         self._build_filename_index()
@@ -1070,9 +1079,15 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
 
         Prefers, in order: already-loaded content, cached content, the size
         cache populated by prefetch_document_sizes() (queries Paperless's
-        /metadata/ endpoint for the served-variant size), then a full download
-        as a last resort. Skipping the size cache turned PROPFIND into an
-        N-document re-download on every listing -- see upstream issue #3.
+        /metadata/ endpoint for the served-variant size). What happens on a
+        full cache miss depends on the provider's stream_downloads setting:
+
+        - Streaming on: do a single /metadata/ probe (one cheap HTTP call).
+          If that fails too, return None and let wsgidav fall back to
+          chunked transfer rather than full-download just to learn a size.
+        - Streaming off: full download (matches pre-fork behaviour). Rarely
+          hit because prefetch_document_sizes already populated the size
+          cache for every PROPFIND member.
 
         Returns:
             Content length in bytes, or None if unknown
@@ -1097,21 +1112,73 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         if cached_size is not None:
             return cached_size
 
-        # Cache miss in both layers -- download to learn the size.
+        if self._provider._stream_downloads:
+            # Streaming mode: one cheap /metadata/ probe; never a full download.
+            client = self._provider._create_client(self.environ)
+            if client is not None:
+                try:
+                    size = run_async(client.get_document_size(self.document.id))
+                    if size is not None:
+                        cache.set_size(self.document.id, size)
+                        return size
+                except Exception as exc:
+                    logger.debug(
+                        "size_probe_failed",
+                        document_id=self.document.id,
+                        error=str(exc),
+                    )
+            return None
+
+        # Buffered mode (default): full download as last resort. With the
+        # metadata-size prefetch in place this should be rare.
         content = self._download_content()
         return len(content)
 
-    def get_content(self) -> io.BytesIO:
+    def get_content(self) -> Any:
         """Return the document content as a file-like object.
 
-        Downloads the document content from Paperless API and returns
-        it as a BytesIO stream.
+        With stream_downloads enabled, returns a streaming wrapper around an
+        httpx response so the body flows through to the WebDAV client without
+        being buffered in this process. Otherwise, downloads the full archive
+        into the in-memory content cache and returns a BytesIO view of it
+        (the historical behaviour, useful when the same doc is re-read within
+        the cache TTL).
+
+        Falls back to a cached body (BytesIO) when one is available, and to
+        an empty body if no Paperless client can be created.
 
         Returns:
-            File-like object containing document content
+            File-like with read(size), close(), and (for the streaming path)
+            forward seek().
         """
-        content = self._download_content()
-        return io.BytesIO(content)
+        cache = get_cache()
+
+        if self._content is not None:
+            return io.BytesIO(self._content)
+
+        cached_content = cache.get_content(self.document.id)
+        if cached_content is not None:
+            self._content = cached_content
+            return io.BytesIO(cached_content)
+
+        if self._provider._stream_downloads:
+            client = self._provider._create_client(self.environ)
+            if client is None:
+                logger.warning("no_client_for_download", document_id=self.document.id)
+                return io.BytesIO(b"")
+            try:
+                return client.open_document_stream(self.document.id)
+            except Exception as exc:
+                logger.error(
+                    "download_document_failed",
+                    document_id=self.document.id,
+                    error=str(exc),
+                )
+                return io.BytesIO(b"")
+
+        # Buffered mode (default): download whole body and let
+        # _download_content populate the content cache.
+        return io.BytesIO(self._download_content())
 
     def get_creation_date(self) -> float:
         """Return the document creation date as Unix timestamp.

@@ -537,3 +537,29 @@ async def test_get_document_sizes_batch_does_not_hit_download_endpoint(
     await client.get_document_sizes_batch([1])
 
     assert download_route.call_count == 0
+
+
+def test_open_document_stream_yields_body_incrementally(
+    client: PaperlessClient, base_url: str
+) -> None:
+    """open_document_stream returns a sync file-like that wsgidav can read
+    in fixed-size blocks. This is the path the WEBDAV_STREAM_DOWNLOADS opt-in
+    runs on the GET hot path; regressing it to a buffer-everything behaviour
+    would re-introduce the ~15 s TTFB on 80 MB docs."""
+    import respx as _respx
+    from httpx import Response as _Response
+
+    body = b"%PDF-1.4 " + b"a" * (200 * 1024) + b"\n%%EOF"
+    with _respx.mock(assert_all_called=False) as router:
+        router.get(f"{base_url}/api/documents/42/download/").mock(
+            return_value=_Response(200, content=body)
+        )
+        stream = client.open_document_stream(42)
+        try:
+            first = stream.read(64 * 1024)
+            assert len(first) == 64 * 1024
+            assert first.startswith(b"%PDF-1.4 ")
+            rest = stream.read()
+            assert first + rest == body
+        finally:
+            stream.close()

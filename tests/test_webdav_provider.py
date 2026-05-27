@@ -751,6 +751,13 @@ def mock_paperless_client() -> AsyncMock:
     client.get_documents.return_value = []
     # Default download returns sample PDF bytes
     client.download_document.return_value = b"%PDF-1.4 sample content"
+    # open_document_stream is sync (not async); supply a BytesIO so any
+    # streaming-mode test that does not override it still works.
+    client.open_document_stream = MagicMock(return_value=BytesIO(b"%PDF-1.4 sample content"))
+    # Default size probe yields no answer, so streaming-mode get_content_length
+    # tests that exercise the cold cache fallback see "size unknown" unless
+    # they explicitly populate the cache or override this.
+    client.get_document_size.return_value = None
     return client
 
 
@@ -1031,6 +1038,137 @@ class TestDocumentContentDownload:
 
         assert length == len(expected_content)
         mock_paperless_client.download_document.assert_called_once_with(sample_document.id)
+
+
+class TestStreamDownloads:
+    """Tests for the WEBDAV_STREAM_DOWNLOADS opt-in (default off)."""
+
+    def test_streaming_off_uses_buffered_download(
+        self,
+        mock_environ_with_token: dict[str, Any],
+        mock_share: MagicMock,
+        sample_document: PaperlessDocument,
+        mock_paperless_client: AsyncMock,
+    ) -> None:
+        """With stream_downloads=False (the default), get_content goes through
+        the historical download_document buffered path and never touches
+        open_document_stream. This preserves the in-memory content cache for
+        re-reads within the cache TTL."""
+        shares: dict[str, Any] = {"tax2025": mock_share}
+        provider = PaperlessProvider(
+            shares=shares,
+            paperless_url="http://paperless.local",
+            stream_downloads=False,
+        )
+        mock_paperless_client.download_document.return_value = b"%PDF-1.4 buffered"
+
+        with patch.object(provider, "_create_client", return_value=mock_paperless_client):
+            doc_resource = DocumentResource(
+                "/tax2025/Tax Invoice 2025.pdf",
+                mock_environ_with_token,
+                provider,
+                sample_document,
+            )
+            data = doc_resource.get_content().read()
+
+        assert data == b"%PDF-1.4 buffered"
+        mock_paperless_client.download_document.assert_called_once_with(sample_document.id)
+        mock_paperless_client.open_document_stream.assert_not_called()
+
+    def test_streaming_on_uses_open_document_stream(
+        self,
+        mock_environ_with_token: dict[str, Any],
+        mock_share: MagicMock,
+        sample_document: PaperlessDocument,
+        mock_paperless_client: AsyncMock,
+    ) -> None:
+        """With stream_downloads=True, get_content returns the streaming wrapper
+        and never calls download_document."""
+        mock_paperless_client.open_document_stream.return_value = BytesIO(b"%PDF-1.4 stream")
+
+        shares: dict[str, Any] = {"tax2025": mock_share}
+        provider = PaperlessProvider(
+            shares=shares,
+            paperless_url="http://paperless.local",
+            stream_downloads=True,
+        )
+
+        with patch.object(provider, "_create_client", return_value=mock_paperless_client):
+            doc_resource = DocumentResource(
+                "/tax2025/Tax Invoice 2025.pdf",
+                mock_environ_with_token,
+                provider,
+                sample_document,
+            )
+            data = doc_resource.get_content().read()
+
+        assert data == b"%PDF-1.4 stream"
+        mock_paperless_client.open_document_stream.assert_called_once_with(sample_document.id)
+        mock_paperless_client.download_document.assert_not_called()
+
+    def test_streaming_on_get_content_length_uses_metadata_probe(
+        self,
+        mock_environ_with_token: dict[str, Any],
+        mock_share: MagicMock,
+        sample_document: PaperlessDocument,
+        mock_paperless_client: AsyncMock,
+    ) -> None:
+        """In streaming mode, a cold size cache must fall back to a single
+        /metadata/ probe, not a full archive download (the issue-#3 regression
+        path that motivated this work)."""
+        mock_paperless_client.get_document_size.return_value = 987654
+
+        shares: dict[str, Any] = {"tax2025": mock_share}
+        provider = PaperlessProvider(
+            shares=shares,
+            paperless_url="http://paperless.local",
+            stream_downloads=True,
+        )
+
+        with patch.object(provider, "_create_client", return_value=mock_paperless_client):
+            doc_resource = DocumentResource(
+                "/tax2025/Tax Invoice 2025.pdf",
+                mock_environ_with_token,
+                provider,
+                sample_document,
+            )
+            length = doc_resource.get_content_length()
+
+        assert length == 987654
+        mock_paperless_client.get_document_size.assert_called_once_with(sample_document.id)
+        mock_paperless_client.download_document.assert_not_called()
+        mock_paperless_client.open_document_stream.assert_not_called()
+
+    def test_streaming_on_get_content_length_returns_none_when_probe_misses(
+        self,
+        mock_environ_with_token: dict[str, Any],
+        mock_share: MagicMock,
+        sample_document: PaperlessDocument,
+        mock_paperless_client: AsyncMock,
+    ) -> None:
+        """If the /metadata/ probe also returns no size, streaming mode
+        prefers chunked transfer over paying a full download for the
+        Content-Length header."""
+        mock_paperless_client.get_document_size.return_value = None
+
+        shares: dict[str, Any] = {"tax2025": mock_share}
+        provider = PaperlessProvider(
+            shares=shares,
+            paperless_url="http://paperless.local",
+            stream_downloads=True,
+        )
+
+        with patch.object(provider, "_create_client", return_value=mock_paperless_client):
+            doc_resource = DocumentResource(
+                "/tax2025/Tax Invoice 2025.pdf",
+                mock_environ_with_token,
+                provider,
+                sample_document,
+            )
+            length = doc_resource.get_content_length()
+
+        assert length is None
+        mock_paperless_client.download_document.assert_not_called()
 
 
 class TestClientCreation:
