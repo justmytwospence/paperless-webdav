@@ -31,6 +31,76 @@ from paperless_webdav.paperless_client import PaperlessClient, PaperlessDocument
 DocumentList = list[PaperlessDocument]
 
 
+def _document_list_cache_key(
+    environ: dict[str, Any],
+    namespace: str,
+    include_tag_ids: list[int],
+    exclude_tag_ids: list[int],
+) -> str:
+    """Build the cache key for a tag-filtered document list.
+
+    Namespacing by token keeps one user's invalidation from clobbering
+    another's view; namespacing by share+role keeps the share root and its
+    done folder as separate entries; including the sorted include/exclude
+    ids means a different filter combination is a different cache entry.
+
+    Keys are formatted so that `:{share_name}:` appears verbatim, which is
+    what `CacheBackend.invalidate_document_lists(share_name)` matches on.
+    """
+    token = environ.get("paperless.token", "")
+    token_key = token[:16] if len(token) >= 16 else token
+    inc = ",".join(str(i) for i in sorted(include_tag_ids))
+    exc = ",".join(str(i) for i in sorted(exclude_tag_ids))
+    return f"{token_key}:{namespace}:{inc}:{exc}"
+
+
+def _load_documents_cached(
+    client: PaperlessClient,
+    environ: dict[str, Any],
+    namespace: str,
+    include_tag_ids: list[int],
+    exclude_tag_ids: list[int],
+    ttl: int,
+) -> DocumentList:
+    """Fetch the tag-filtered document list, optionally consulting the cache.
+
+    When `ttl <= 0` (the default for WEBDAV_DOCUMENT_LIST_TTL=0) the cache is
+    bypassed -- every call paginates the full list from Paperless. When
+    `ttl > 0`, the cache is consulted and populated with the given TTL.
+
+    Without this cache every WebDAV request that resolves a path under a
+    share (PROPFIND, GET, HEAD, PUT, MOVE, ...) re-paginates the whole
+    document list. For a ~130-doc share that is ~12 s of sequential page
+    fetches on every request.
+    """
+    from dataclasses import asdict as _asdict
+
+    if ttl <= 0:
+        return run_async(
+            client.get_documents(
+                include_tag_ids=include_tag_ids,
+                exclude_tag_ids=exclude_tag_ids,
+            )
+        )
+
+    cache = get_cache()
+    cache_key = _document_list_cache_key(environ, namespace, include_tag_ids, exclude_tag_ids)
+    cached = cache.get_document_list(cache_key)
+    if cached is not None:
+        logger.debug("documents_cache_hit", namespace=namespace, count=len(cached))
+        return [PaperlessDocument(**doc) for doc in cached]
+
+    documents = run_async(
+        client.get_documents(
+            include_tag_ids=include_tag_ids,
+            exclude_tag_ids=exclude_tag_ids,
+        )
+    )
+    cache.set_document_list(cache_key, [_asdict(d) for d in documents], ttl=ttl)
+    logger.debug("documents_cache_miss", namespace=namespace, count=len(documents))
+    return documents
+
+
 def prefetch_document_sizes(client: PaperlessClient, documents: DocumentList) -> None:
     """Pre-fetch and cache sizes for all documents concurrently.
 
@@ -544,12 +614,15 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
                 done_tag_ids = self._resolve_tag_ids_from_map(tag_map, [self._share.done_tag])
                 exclude_tag_ids.extend(done_tag_ids)
 
-            # Fetch documents with tag filters
-            documents = run_async(
-                client.get_documents(
-                    include_tag_ids=include_tag_ids,
-                    exclude_tag_ids=exclude_tag_ids,
-                )
+            # Fetch documents (consults the document-list cache when
+            # WEBDAV_DOCUMENT_LIST_TTL>0, otherwise paginates from Paperless).
+            documents = _load_documents_cached(
+                client,
+                self.environ,
+                namespace=f"{self._share.name}:root",
+                include_tag_ids=include_tag_ids,
+                exclude_tag_ids=exclude_tag_ids,
+                ttl=self._provider._document_list_ttl,
             )
             logger.debug(
                 "loaded_documents_dynamically",
@@ -822,12 +895,15 @@ class DoneFolderResource(DAVCollection):  # type: ignore[misc]
                 tag_map, list(self._share.exclude_tags)
             )
 
-            # Fetch documents with tag filters
-            documents = run_async(
-                client.get_documents(
-                    include_tag_ids=include_tag_ids,
-                    exclude_tag_ids=exclude_tag_ids,
-                )
+            # Fetch documents (consults the document-list cache when
+            # WEBDAV_DOCUMENT_LIST_TTL>0, otherwise paginates from Paperless).
+            documents = _load_documents_cached(
+                client,
+                self.environ,
+                namespace=f"{self._share.name}:done",
+                include_tag_ids=include_tag_ids,
+                exclude_tag_ids=exclude_tag_ids,
+                ttl=self._provider._document_list_ttl,
             )
             logger.debug(
                 "loaded_done_documents",
@@ -1539,6 +1615,7 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
                 document_id=self.document.id,
                 done_tag_id=done_tag_id,
             )
+            self._invalidate_share_document_lists()
             return True
         except Exception as exc:
             logger.error(
@@ -1581,6 +1658,7 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
                 document_id=self.document.id,
                 done_tag_id=done_tag_id,
             )
+            self._invalidate_share_document_lists()
             return True
         except Exception as exc:
             logger.error(
@@ -1590,6 +1668,28 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
                 error=str(exc),
             )
             return False
+
+    def _invalidate_share_document_lists(self) -> None:
+        """Drop cached document lists for this document's share after a write.
+
+        Keeps the cache strictly fresher than the TTL would on its own: an
+        in-WebDAV MOVE or DELETE never has to wait for the TTL to expire
+        before the change shows up in subsequent listings. Out-of-band
+        Paperless changes (e.g. tag edits in the web UI) still rely on the
+        TTL.
+        """
+        if self._provider._document_list_ttl <= 0:
+            return
+        if self._share is None:
+            return
+        try:
+            get_cache().invalidate_document_lists(self._share.name)
+        except Exception as exc:
+            logger.debug(
+                "invalidate_document_lists_failed",
+                share=self._share.name,
+                error=str(exc),
+            )
 
     def delete(self) -> None:
         """Handle deletion of document resource.
