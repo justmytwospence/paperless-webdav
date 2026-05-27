@@ -963,6 +963,75 @@ class TestDocumentContentDownload:
         # Should be the actual size of downloaded content
         assert length == len(expected_content)
 
+    def test_get_content_length_uses_size_cache_without_downloading(
+        self,
+        mock_environ_with_token: dict[str, Any],
+        mock_share: MagicMock,
+        sample_document: PaperlessDocument,
+        mock_paperless_client: AsyncMock,
+    ) -> None:
+        """Regression for upstream issue #3.
+
+        After prefetch_document_sizes() populates the size cache, a PROPFIND on
+        the share calls get_content_length() for each member. That call must
+        return the cached size without downloading the document; otherwise a
+        directory listing of N documents triggers N full archive downloads.
+        """
+        from paperless_webdav.cache import get_cache
+
+        cache = get_cache()
+        cache.set_size(sample_document.id, 1515552)
+
+        shares: dict[str, Any] = {"tax2025": mock_share}
+        provider = PaperlessProvider(
+            shares=shares,
+            paperless_url="http://paperless.local",
+        )
+
+        with patch.object(provider, "_create_client", return_value=mock_paperless_client):
+            doc_resource = DocumentResource(
+                "/tax2025/Tax Invoice 2025.pdf",
+                mock_environ_with_token,
+                provider,
+                sample_document,
+            )
+            length = doc_resource.get_content_length()
+
+        assert length == 1515552
+        mock_paperless_client.download_document.assert_not_called()
+
+    def test_get_content_length_falls_back_to_download_on_cache_miss(
+        self,
+        mock_environ_with_token: dict[str, Any],
+        mock_share: MagicMock,
+        sample_document: PaperlessDocument,
+        mock_paperless_client: AsyncMock,
+    ) -> None:
+        """With neither cached content nor a cached size, get_content_length()
+        must still return a correct size. This is the path that runs the very
+        first time a document is listed before the prefetch can run, e.g. when
+        the size cache TTL has expired but the document is still present."""
+        expected_content = b"%PDF-1.4 body of length determined by download"
+        mock_paperless_client.download_document.return_value = expected_content
+
+        shares: dict[str, Any] = {"tax2025": mock_share}
+        provider = PaperlessProvider(
+            shares=shares,
+            paperless_url="http://paperless.local",
+        )
+
+        with patch.object(provider, "_create_client", return_value=mock_paperless_client):
+            doc_resource = DocumentResource(
+                "/tax2025/Tax Invoice 2025.pdf",
+                mock_environ_with_token,
+                provider,
+                sample_document,
+            )
+            length = doc_resource.get_content_length()
+
+        assert length == len(expected_content)
+        mock_paperless_client.download_document.assert_called_once_with(sample_document.id)
+
 
 class TestClientCreation:
     """Tests for PaperlessClient creation from environ."""

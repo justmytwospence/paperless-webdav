@@ -268,10 +268,29 @@ class PaperlessClient:
             logger.debug("downloaded_document", document_id=document_id, size=len(content))
             return content
 
+    @staticmethod
+    def _served_size_from_metadata(metadata: dict[str, Any]) -> int | None:
+        """Return the size of the body that GET /download/ will serve.
+
+        Paperless returns the archived (OCR'd) PDF when an archive exists, else
+        the original file. The metadata endpoint exposes both. HEAD on /download/
+        used to be used here, but it reports the original-file size even when GET
+        returns the larger archive, which broke Content-Length consistency and
+        forced full re-downloads on every PROPFIND.
+        """
+        archive_size = metadata.get("archive_size")
+        if isinstance(archive_size, int) and archive_size > 0:
+            return archive_size
+        original_size = metadata.get("original_size")
+        if isinstance(original_size, int) and original_size > 0:
+            return original_size
+        return None
+
     async def get_document_size(self, document_id: int) -> int | None:
         """Get the size of a document without downloading it.
 
-        Uses a HEAD request to the download endpoint to get Content-Length.
+        Queries /api/documents/{id}/metadata/ and returns the served-variant
+        size (archive when present, else original).
 
         Args:
             document_id: The ID of the document
@@ -279,27 +298,24 @@ class PaperlessClient:
         Returns:
             Size in bytes, or None if unavailable
         """
-        url = f"{self.base_url}/api/documents/{document_id}/download/"
-        timeout = httpx.Timeout(30.0, read=60.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            try:
-                response = await client.head(url, headers=self._headers)
-                response.raise_for_status()
-                content_length = response.headers.get("Content-Length")
-                if content_length:
-                    size = int(content_length)
-                    logger.debug("got_document_size", document_id=document_id, size=size)
-                    return size
-            except Exception as e:
-                logger.debug("get_document_size_failed", document_id=document_id, error=str(e))
-        return None
+        try:
+            response = await self._request("GET", f"/api/documents/{document_id}/metadata/")
+            response.raise_for_status()
+            size = self._served_size_from_metadata(response.json())
+            if size is not None:
+                logger.debug("got_document_size", document_id=document_id, size=size)
+            return size
+        except Exception as e:
+            logger.debug("get_document_size_failed", document_id=document_id, error=str(e))
+            return None
 
     async def get_document_sizes_batch(
         self, document_ids: list[int], max_concurrent: int = 10
     ) -> dict[int, int]:
         """Get sizes for multiple documents concurrently.
 
-        Uses concurrent HEAD requests with a semaphore to limit parallelism.
+        Issues concurrent GETs against /api/documents/{id}/metadata/ with a
+        semaphore to bound parallelism.
 
         Args:
             document_ids: List of document IDs to fetch sizes for
@@ -319,13 +335,13 @@ class PaperlessClient:
 
         async def fetch_size(client: httpx.AsyncClient, doc_id: int) -> None:
             async with semaphore:
-                url = f"{self.base_url}/api/documents/{doc_id}/download/"
+                url = f"{self.base_url}/api/documents/{doc_id}/metadata/"
                 try:
-                    response = await client.head(url, headers=self._headers)
+                    response = await client.get(url, headers=self._headers)
                     response.raise_for_status()
-                    content_length = response.headers.get("Content-Length")
-                    if content_length:
-                        results[doc_id] = int(content_length)
+                    size = self._served_size_from_metadata(response.json())
+                    if size is not None:
+                        results[doc_id] = size
                 except Exception as e:
                     logger.debug("batch_get_size_failed", document_id=doc_id, error=str(e))
 

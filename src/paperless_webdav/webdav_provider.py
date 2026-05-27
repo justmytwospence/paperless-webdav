@@ -1028,10 +1028,13 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
                 self._content = run_async(client.download_document(self.document.id))
                 actual_size = len(self._content)
 
-                # Check if cached size differs from actual size (HEAD vs GET mismatch)
+                # Check if cached size differs from actual size. With the
+                # metadata-endpoint size prefetch in place, this is now rare and
+                # logged at debug rather than warn so a normal listing isn't
+                # noisy.
                 cached_size = cache.get_size(self.document.id)
                 if cached_size is not None and cached_size != actual_size:
-                    logger.warning(
+                    logger.debug(
                         "size_mismatch_corrected",
                         document_id=self.document.id,
                         cached_size=cached_size,
@@ -1065,10 +1068,11 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
     def get_content_length(self) -> int | None:
         """Return the content length.
 
-        Always downloads content if not already loaded to ensure the
-        Content-Length matches the actual content that get_content() returns.
-        This avoids mismatches where HEAD-derived cached sizes differ from
-        actual GET content sizes.
+        Prefers, in order: already-loaded content, cached content, the size
+        cache populated by prefetch_document_sizes() (queries Paperless's
+        /metadata/ endpoint for the served-variant size), then a full download
+        as a last resort. Skipping the size cache turned PROPFIND into an
+        N-document re-download on every listing -- see upstream issue #3.
 
         Returns:
             Content length in bytes, or None if unknown
@@ -1077,16 +1081,23 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         if self._content is not None:
             return len(self._content)
 
-        # Check if we have actual content cached (not just HEAD-derived size)
         cache = get_cache()
+
+        # Prefer cached content (size is exact)
         cached_content = cache.get_content(self.document.id)
         if cached_content is not None:
-            # Content is cached, so size is accurate
             self._content = cached_content
             return len(self._content)
 
-        # No content cached - download it to ensure accurate size
-        # This is necessary because HEAD-derived sizes may differ from GET content
+        # Fall back to the size cache populated by prefetch_document_sizes().
+        # The prefetch queries /api/documents/{id}/metadata/ which returns the
+        # archive size (the served variant), so this matches what get_content()
+        # will eventually return.
+        cached_size = cache.get_size(self.document.id)
+        if cached_size is not None:
+            return cached_size
+
+        # Cache miss in both layers -- download to learn the size.
         content = self._download_content()
         return len(content)
 
