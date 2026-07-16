@@ -988,7 +988,7 @@ class TestDocumentContentDownload:
         from paperless_webdav.cache import get_cache
 
         cache = get_cache()
-        cache.set_size(sample_document.id, 1515552)
+        cache.set_size(sample_document.id, 1515552, version=sample_document.modified)
 
         shares: dict[str, Any] = {"tax2025": mock_share}
         provider = PaperlessProvider(
@@ -1007,6 +1007,47 @@ class TestDocumentContentDownload:
 
         assert length == 1515552
         mock_paperless_client.download_document.assert_not_called()
+
+    def test_get_content_length_ignores_size_cached_for_an_older_revision(
+        self,
+        mock_environ_with_token: dict[str, Any],
+        mock_share: MagicMock,
+        sample_document: PaperlessDocument,
+        mock_paperless_client: AsyncMock,
+    ) -> None:
+        """Sizes are keyed by the document's `modified` timestamp.
+
+        A size cached before a re-OCR must not be served for the document
+        afterwards -- a stale Content-Length would truncate the streamed
+        archive. This versioning is what makes a long WEBDAV_SIZE_TTL safe.
+        """
+        from dataclasses import replace
+
+        from paperless_webdav.cache import get_cache
+
+        cache = get_cache()
+        cache.set_size(sample_document.id, 1515552, version="2026-01-01T00:00:00Z")
+        reocred = replace(sample_document, modified="2026-07-16T12:00:00Z")
+
+        shares: dict[str, Any] = {"tax2025": mock_share}
+        provider = PaperlessProvider(
+            shares=shares,
+            paperless_url="http://paperless.local",
+            stream_downloads=True,
+        )
+        mock_paperless_client.get_document_size.return_value = 2222222
+
+        with patch.object(provider, "_create_client", return_value=mock_paperless_client):
+            doc_resource = DocumentResource(
+                "/tax2025/Tax Invoice 2025.pdf",
+                mock_environ_with_token,
+                provider,
+                reocred,
+            )
+            length = doc_resource.get_content_length()
+
+        assert length == 2222222
+        assert cache.get_size(reocred.id, "2026-07-16T12:00:00Z") == 2222222
 
     def test_get_content_length_falls_back_to_download_on_cache_miss(
         self,

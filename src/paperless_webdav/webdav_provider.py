@@ -101,23 +101,29 @@ def _load_documents_cached(
     return documents
 
 
-def prefetch_document_sizes(client: PaperlessClient, documents: DocumentList) -> None:
+def prefetch_document_sizes(
+    client: PaperlessClient, documents: DocumentList, ttl: float | None = None
+) -> None:
     """Pre-fetch and cache sizes for all documents concurrently.
 
-    This issues concurrent HEAD requests for all documents to populate
+    This issues concurrent /metadata/ requests for all documents to populate
     the size cache, avoiding sequential requests during PROPFIND.
 
     Args:
         client: The PaperlessClient to use
         documents: List of documents to pre-fetch sizes for
+        ttl: Seconds to cache each size for; None uses the cache default.
     """
     if not documents:
         return
 
     cache = get_cache()
 
-    # Filter out documents whose sizes are already cached
-    doc_ids_to_fetch = [doc.id for doc in documents if cache.get_size(doc.id) is None]
+    # Filter out documents whose sizes are already cached. Sizes are versioned
+    # by `modified`, so an edited document misses here and is re-probed even if
+    # its previous size is still within TTL.
+    versions = {doc.id: doc.modified for doc in documents}
+    doc_ids_to_fetch = [doc.id for doc in documents if cache.get_size(doc.id, doc.modified) is None]
 
     if not doc_ids_to_fetch:
         logger.debug("prefetch_all_cached", total=len(documents))
@@ -135,7 +141,7 @@ def prefetch_document_sizes(client: PaperlessClient, documents: DocumentList) ->
 
         # Cache all fetched sizes
         for doc_id, size in sizes.items():
-            cache.set_size(doc_id, size)
+            cache.set_size(doc_id, size, ttl=ttl, version=versions.get(doc_id))
 
         logger.debug(
             "prefetch_complete",
@@ -278,6 +284,7 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
         share_loader: Callable[[], dict[str, Any]] | None = None,
         stream_downloads: bool = False,
         document_list_ttl: int = 0,
+        size_ttl: int = 300,
     ) -> None:
         """Initialize the provider.
 
@@ -293,6 +300,9 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
                 Default False preserves the legacy buffered+cached behaviour.
             document_list_ttl: Seconds to cache per-share document listings.
                 0 disables the cache (every request paginates from Paperless).
+            size_ttl: Seconds to cache per-document sizes. Entries are keyed by
+                each document's `modified`, so this bounds staleness only for
+                changes Paperless makes without touching `modified`.
         """
         super().__init__()
         self._shares: dict[str, Share] = shares or {}
@@ -301,6 +311,7 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
         self._share_loader: Callable[[], dict[str, Any]] | None = share_loader
         self._stream_downloads: bool = stream_downloads
         self._document_list_ttl: int = document_list_ttl
+        self._size_ttl: int = size_ttl
         # Build filename-to-document mapping for each share (static mode)
         self._doc_by_filename: dict[str, dict[str, PaperlessDocument]] = {}
         self._build_filename_index()
@@ -631,7 +642,7 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
             )
 
             # Pre-fetch all document sizes concurrently
-            prefetch_document_sizes(client, documents)
+            prefetch_document_sizes(client, documents, ttl=self._provider._size_ttl)
 
             return documents
 
@@ -912,7 +923,7 @@ class DoneFolderResource(DAVCollection):  # type: ignore[misc]
             )
 
             # Pre-fetch all document sizes concurrently
-            prefetch_document_sizes(client, documents)
+            prefetch_document_sizes(client, documents, ttl=self._provider._size_ttl)
 
             return documents
 
@@ -1117,7 +1128,7 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
                 # metadata-endpoint size prefetch in place, this is now rare and
                 # logged at debug rather than warn so a normal listing isn't
                 # noisy.
-                cached_size = cache.get_size(self.document.id)
+                cached_size = cache.get_size(self.document.id, self.document.modified)
                 if cached_size is not None and cached_size != actual_size:
                     logger.debug(
                         "size_mismatch_corrected",
@@ -1184,7 +1195,7 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         # The prefetch queries /api/documents/{id}/metadata/ which returns the
         # archive size (the served variant), so this matches what get_content()
         # will eventually return.
-        cached_size = cache.get_size(self.document.id)
+        cached_size = cache.get_size(self.document.id, self.document.modified)
         if cached_size is not None:
             return cached_size
 
@@ -1195,7 +1206,12 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
                 try:
                     size = run_async(client.get_document_size(self.document.id))
                     if size is not None:
-                        cache.set_size(self.document.id, size)
+                        cache.set_size(
+                            self.document.id,
+                            size,
+                            ttl=self._provider._size_ttl,
+                            version=self.document.modified,
+                        )
                         return size
                 except Exception as exc:
                     logger.debug(
