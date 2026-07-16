@@ -26,6 +26,7 @@ from paperless_webdav.async_bridge import run_async
 from paperless_webdav.cache import get_cache
 from paperless_webdav.logging import get_logger
 from paperless_webdav.paperless_client import PaperlessClient, PaperlessDocument
+from paperless_webdav.services.document_sizes import load_sizes, store_sizes
 
 # Type alias for clarity
 DocumentList = list[PaperlessDocument]
@@ -101,50 +102,89 @@ def _load_documents_cached(
     return documents
 
 
-def prefetch_document_sizes(client: PaperlessClient, documents: DocumentList) -> None:
-    """Pre-fetch and cache sizes for all documents concurrently.
+# How many documents to measure per round trip before persisting. Sizes are
+# stored per chunk rather than once at the end so that a client which gives up
+# mid-listing still leaves behind everything measured so far -- see the comment
+# in prefetch_document_sizes. Chunking costs nothing: concurrency is applied
+# within each chunk, so the total wall time is unchanged.
+SIZE_PROBE_CHUNK = 100
 
-    This issues concurrent HEAD requests for all documents to populate
-    the size cache, avoiding sequential requests during PROPFIND.
+
+def prefetch_document_sizes(
+    client: PaperlessClient, documents: DocumentList, ttl: float | None = None
+) -> None:
+    """Ensure sizes for all documents are known, measuring only what is missing.
+
+    Three layers, cheapest first: the process-local cache, the durable
+    document_sizes table, and finally Paperless itself. Only the last is
+    expensive, and its results are persisted so that no size is ever measured
+    twice.
 
     Args:
         client: The PaperlessClient to use
-        documents: List of documents to pre-fetch sizes for
+        documents: List of documents to ensure sizes for
+        ttl: Seconds to cache each size in memory for; None uses the default.
     """
     if not documents:
         return
 
     cache = get_cache()
 
-    # Filter out documents whose sizes are already cached
-    doc_ids_to_fetch = [doc.id for doc in documents if cache.get_size(doc.id) is None]
+    # Sizes are versioned by `modified`, so an edited document misses at every
+    # layer and is re-measured even if its previous size is still around.
+    versions = {doc.id: doc.modified for doc in documents}
 
-    if not doc_ids_to_fetch:
+    missing = [doc.id for doc in documents if cache.get_size(doc.id, doc.modified) is None]
+    if not missing:
         logger.debug("prefetch_all_cached", total=len(documents))
+        return
+
+    # The durable store. This is what makes a restart cheap and, more
+    # importantly, what lets an interrupted listing resume: work paid for by an
+    # earlier attempt -- even one the client abandoned -- is still here.
+    stored = load_sizes(missing)
+    to_measure: list[int] = []
+    for doc_id in missing:
+        entry = stored.get(doc_id)
+        if entry is not None and entry[0] == versions.get(doc_id):
+            cache.set_size(doc_id, entry[1], ttl=ttl, version=versions.get(doc_id))
+        else:
+            to_measure.append(doc_id)
+
+    if not to_measure:
+        logger.debug("prefetch_served_from_store", total=len(documents), restored=len(stored))
         return
 
     logger.debug(
         "prefetch_starting",
         total=len(documents),
-        to_fetch=len(doc_ids_to_fetch),
+        from_store=len(missing) - len(to_measure),
+        to_measure=len(to_measure),
     )
 
-    try:
-        # Fetch sizes concurrently
-        sizes = run_async(client.get_document_sizes_batch(doc_ids_to_fetch))
+    # Whatever is left has to be measured against Paperless, one request per
+    # document. Persist each chunk before starting the next: a large share can
+    # take longer to measure than a WebDAV client will wait, and if a
+    # disconnect discarded the whole batch the client could never make progress
+    # no matter how often it retried. Chunked writes turn that into a resumable
+    # walk that converges across attempts.
+    measured = 0
+    for start in range(0, len(to_measure), SIZE_PROBE_CHUNK):
+        chunk = to_measure[start : start + SIZE_PROBE_CHUNK]
+        try:
+            sizes = run_async(client.get_document_sizes_batch(chunk))
+            for doc_id, size in sizes.items():
+                cache.set_size(doc_id, size, ttl=ttl, version=versions.get(doc_id))
+            store_sizes(sizes, versions)
+            measured += len(sizes)
+        except Exception as e:
+            # A listing degrades to "sizes unknown", it never breaks. Whatever
+            # earlier chunks already persisted still stands, so the next attempt
+            # picks up from there rather than starting over.
+            logger.warning("prefetch_failed", measured=measured, error=str(e))
+            return
 
-        # Cache all fetched sizes
-        for doc_id, size in sizes.items():
-            cache.set_size(doc_id, size)
-
-        logger.debug(
-            "prefetch_complete",
-            requested=len(doc_ids_to_fetch),
-            fetched=len(sizes),
-        )
-    except Exception as e:
-        # Don't fail document listing if prefetch fails
-        logger.warning("prefetch_failed", error=str(e))
+    logger.debug("prefetch_complete", requested=len(to_measure), measured=measured)
 
 
 if TYPE_CHECKING:
@@ -278,6 +318,7 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
         share_loader: Callable[[], dict[str, Any]] | None = None,
         stream_downloads: bool = False,
         document_list_ttl: int = 0,
+        size_ttl: int = 300,
     ) -> None:
         """Initialize the provider.
 
@@ -293,6 +334,9 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
                 Default False preserves the legacy buffered+cached behaviour.
             document_list_ttl: Seconds to cache per-share document listings.
                 0 disables the cache (every request paginates from Paperless).
+            size_ttl: Seconds to cache per-document sizes. Entries are keyed by
+                each document's `modified`, so this bounds staleness only for
+                changes Paperless makes without touching `modified`.
         """
         super().__init__()
         self._shares: dict[str, Share] = shares or {}
@@ -301,6 +345,7 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
         self._share_loader: Callable[[], dict[str, Any]] | None = share_loader
         self._stream_downloads: bool = stream_downloads
         self._document_list_ttl: int = document_list_ttl
+        self._size_ttl: int = size_ttl
         # Build filename-to-document mapping for each share (static mode)
         self._doc_by_filename: dict[str, dict[str, PaperlessDocument]] = {}
         self._build_filename_index()
@@ -631,7 +676,7 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
             )
 
             # Pre-fetch all document sizes concurrently
-            prefetch_document_sizes(client, documents)
+            prefetch_document_sizes(client, documents, ttl=self._provider._size_ttl)
 
             return documents
 
@@ -912,7 +957,7 @@ class DoneFolderResource(DAVCollection):  # type: ignore[misc]
             )
 
             # Pre-fetch all document sizes concurrently
-            prefetch_document_sizes(client, documents)
+            prefetch_document_sizes(client, documents, ttl=self._provider._size_ttl)
 
             return documents
 
@@ -1117,7 +1162,7 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
                 # metadata-endpoint size prefetch in place, this is now rare and
                 # logged at debug rather than warn so a normal listing isn't
                 # noisy.
-                cached_size = cache.get_size(self.document.id)
+                cached_size = cache.get_size(self.document.id, self.document.modified)
                 if cached_size is not None and cached_size != actual_size:
                     logger.debug(
                         "size_mismatch_corrected",
@@ -1184,7 +1229,7 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         # The prefetch queries /api/documents/{id}/metadata/ which returns the
         # archive size (the served variant), so this matches what get_content()
         # will eventually return.
-        cached_size = cache.get_size(self.document.id)
+        cached_size = cache.get_size(self.document.id, self.document.modified)
         if cached_size is not None:
             return cached_size
 
@@ -1195,7 +1240,12 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
                 try:
                     size = run_async(client.get_document_size(self.document.id))
                     if size is not None:
-                        cache.set_size(self.document.id, size)
+                        cache.set_size(
+                            self.document.id,
+                            size,
+                            ttl=self._provider._size_ttl,
+                            version=self.document.modified,
+                        )
                         return size
                 except Exception as exc:
                     logger.debug(

@@ -68,6 +68,18 @@ class Settings(BaseSettings):
             "writes that change membership."
         ),
     )
+    webdav_size_ttl: int = Field(
+        default=300,
+        description=(
+            "Seconds to cache per-document sizes read from /api/documents/{id}/"
+            "metadata/. A cold PROPFIND probes every member of a share, so on a "
+            "large share this TTL decides how often clients pay that fan-out; at "
+            "the 300s default a share re-listed after 5 idle minutes pays it "
+            "again in full. Entries are versioned by each document's `modified` "
+            "timestamp, so an edit or re-OCR invalidates that document's size "
+            "immediately regardless of TTL -- a long TTL is therefore safe."
+        ),
+    )
 
     model_config = {"env_prefix": "", "case_sensitive": False}
 

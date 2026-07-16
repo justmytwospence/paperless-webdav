@@ -28,8 +28,14 @@ class CacheBackend(Protocol):
 
     def get_content(self, document_id: int) -> bytes | None: ...
     def set_content(self, document_id: int, content: bytes, ttl: float | None = None) -> None: ...
-    def get_size(self, document_id: int) -> int | None: ...
-    def set_size(self, document_id: int, size: int, ttl: float | None = None) -> None: ...
+    def get_size(self, document_id: int, version: str | None = None) -> int | None: ...
+    def set_size(
+        self,
+        document_id: int,
+        size: int,
+        ttl: float | None = None,
+        version: str | None = None,
+    ) -> None: ...
     def get_tag_map(self, token: str) -> dict[str, int] | None: ...
     def set_tag_map(
         self, token: str, tag_map: dict[str, int], ttl: float | None = None
@@ -54,7 +60,7 @@ class InMemoryCache:
 
     def __init__(self) -> None:
         self._content_cache: dict[int, CacheEntry] = {}
-        self._size_cache: dict[int, CacheEntry] = {}
+        self._size_cache: dict[tuple[int, str | None], CacheEntry] = {}
         self._tag_map_cache: dict[str, CacheEntry] = {}
         self._document_list_cache: dict[str, CacheEntry] = {}
         self._lock = Lock()
@@ -78,8 +84,10 @@ class InMemoryCache:
                 value=content,
                 expires_at=time.time() + ttl,
             )
-            # Also cache the size since we have the content
-            self._size_cache[document_id] = CacheEntry(
+            # Also cache the size since we have the content. Stored unversioned
+            # (the content path has no `modified` to hand) -- mirrors the plain
+            # size:{id} key the Redis backend writes here.
+            self._size_cache[(document_id, None)] = CacheEntry(
                 value=len(content),
                 expires_at=time.time() + ttl,
             )
@@ -87,22 +95,34 @@ class InMemoryCache:
             "cache_set_content", document_id=document_id, size=len(content), backend="memory"
         )
 
-    def get_size(self, document_id: int) -> int | None:
+    def get_size(self, document_id: int, version: str | None = None) -> int | None:
+        key = (document_id, version)
         with self._lock:
-            entry = self._size_cache.get(document_id)
+            entry = self._size_cache.get(key)
             if entry is None:
                 return None
             if time.time() > entry.expires_at:
-                del self._size_cache[document_id]
+                del self._size_cache[key]
                 return None
             logger.debug("cache_hit_size", document_id=document_id, backend="memory")
             return entry.value
 
-    def set_size(self, document_id: int, size: int, ttl: float | None = None) -> None:
+    def set_size(
+        self,
+        document_id: int,
+        size: int,
+        ttl: float | None = None,
+        version: str | None = None,
+    ) -> None:
         if ttl is None:
             ttl = SIZE_TTL
         with self._lock:
-            self._size_cache[document_id] = CacheEntry(
+            # Keying on version means a superseded entry is never read again, but
+            # it is also never deleted -- drop it here so a long TTL on a busy
+            # document can't accumulate one dead entry per edit.
+            for stale in [k for k in self._size_cache if k[0] == document_id and k[1] != version]:
+                del self._size_cache[stale]
+            self._size_cache[(document_id, version)] = CacheEntry(
                 value=size,
                 expires_at=time.time() + ttl,
             )
@@ -169,7 +189,8 @@ class InMemoryCache:
     def invalidate_content(self, document_id: int) -> None:
         with self._lock:
             self._content_cache.pop(document_id, None)
-            self._size_cache.pop(document_id, None)
+            for key in [k for k in self._size_cache if k[0] == document_id]:
+                del self._size_cache[key]
         logger.debug("cache_invalidate", document_id=document_id, backend="memory")
 
     def clear(self) -> None:
@@ -209,8 +230,10 @@ class RedisCache:
     def _content_key(self, document_id: int) -> str:
         return f"{self._prefix}content:{document_id}"
 
-    def _size_key(self, document_id: int) -> str:
-        return f"{self._prefix}size:{document_id}"
+    def _size_key(self, document_id: int, version: str | None = None) -> str:
+        if version is None:
+            return f"{self._prefix}size:{document_id}"
+        return f"{self._prefix}size:{document_id}:{version}"
 
     def _tag_map_key(self, token: str) -> str:
         cache_key = token[:16] if len(token) >= 16 else token
@@ -244,9 +267,9 @@ class RedisCache:
         except Exception as e:
             logger.warning("redis_cache_error", operation="set_content", error=str(e))
 
-    def get_size(self, document_id: int) -> int | None:
+    def get_size(self, document_id: int, version: str | None = None) -> int | None:
         try:
-            size_bytes = self._redis.get(self._size_key(document_id))
+            size_bytes = self._redis.get(self._size_key(document_id, version))
             if size_bytes is not None:
                 logger.debug("cache_hit_size", document_id=document_id, backend="redis")
                 return int(size_bytes.decode())
@@ -255,11 +278,17 @@ class RedisCache:
             logger.warning("redis_cache_error", operation="get_size", error=str(e))
             return None
 
-    def set_size(self, document_id: int, size: int, ttl: float | None = None) -> None:
+    def set_size(
+        self,
+        document_id: int,
+        size: int,
+        ttl: float | None = None,
+        version: str | None = None,
+    ) -> None:
         if ttl is None:
             ttl = SIZE_TTL
         try:
-            self._redis.setex(self._size_key(document_id), int(ttl), str(size).encode())
+            self._redis.setex(self._size_key(document_id, version), int(ttl), str(size).encode())
             logger.debug("cache_set_size", document_id=document_id, size=size, backend="redis")
         except Exception as e:
             logger.warning("redis_cache_error", operation="set_size", error=str(e))
