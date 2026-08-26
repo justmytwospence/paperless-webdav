@@ -11,11 +11,13 @@ import pytest
 from paperless_webdav.cache import get_cache
 from paperless_webdav.paperless_client import PaperlessDocument, PaperlessTag
 from paperless_webdav.webdav_provider import (
+    SIZE_PROBE_CHUNK,
     DocumentResource,
     DoneFolderResource,
     PaperlessProvider,
     RootResource,
     ShareResource,
+    prefetch_document_sizes,
     sanitize_filename,
 )
 
@@ -759,6 +761,10 @@ def mock_paperless_client() -> AsyncMock:
     # tests that exercise the cold cache fallback see "size unknown" unless
     # they explicitly populate the cache or override this.
     client.get_document_size.return_value = None
+    # Same for the batch probe. Without this the AsyncMock hands back another
+    # AsyncMock, whose .items() is a coroutine -- which used to be swallowed by
+    # the prefetch's catch-all and silently reported as "prefetch_failed".
+    client.get_document_sizes_batch.return_value = {}
     return client
 
 
@@ -2947,3 +2953,118 @@ class TestMoveValidation:
                 resource.handle_move("/share2/done/Doc.pdf")
 
             assert exc.value.value == 403
+
+
+class TestDocumentSizeStore:
+    """Sizes are measured once and persisted, not cached with an expiry.
+
+    Paperless serves ~25 size probes a second no matter the concurrency, so a
+    few hundred documents is tens of seconds of fan-out -- longer than a WebDAV
+    client will wait. These tests pin the two properties that keep that cost
+    from being paid more than once.
+    """
+
+    @staticmethod
+    def _docs(count: int, modified: str = "2026-08-01T00:00:00Z") -> list[PaperlessDocument]:
+        return [
+            PaperlessDocument(
+                id=i,
+                title=f"Doc {i}",
+                original_file_name=f"doc-{i}.pdf",
+                created="2026-08-01",
+                modified=modified,
+                tags=[1],
+            )
+            for i in range(1, count + 1)
+        ]
+
+    def test_stored_sizes_are_not_remeasured(self, mock_paperless_client: AsyncMock) -> None:
+        """A size already in the store must not cost a Paperless request."""
+        docs = self._docs(3)
+        stored = {d.id: (d.modified, 1000 + d.id) for d in docs}
+
+        with (
+            patch("paperless_webdav.webdav_provider.load_sizes", return_value=stored),
+            patch("paperless_webdav.webdav_provider.store_sizes") as store,
+        ):
+            prefetch_document_sizes(mock_paperless_client, docs)
+
+        mock_paperless_client.get_document_sizes_batch.assert_not_called()
+        store.assert_not_called()
+
+        cache = get_cache()
+        for d in docs:
+            assert cache.get_size(d.id, d.modified) == 1000 + d.id
+
+    def test_superseded_version_is_remeasured(self, mock_paperless_client: AsyncMock) -> None:
+        """A stored size from an older revision must not be trusted.
+
+        Serving a stale Content-Length into a streamed download truncates it,
+        so a re-OCR has to fall through to a fresh measurement.
+        """
+        docs = self._docs(2, modified="2026-08-02T00:00:00Z")
+        stale = {d.id: ("2026-01-01T00:00:00Z", 999) for d in docs}
+        mock_paperless_client.get_document_sizes_batch.return_value = {1: 111, 2: 222}
+
+        with (
+            patch("paperless_webdav.webdav_provider.load_sizes", return_value=stale),
+            patch("paperless_webdav.webdav_provider.store_sizes") as store,
+        ):
+            prefetch_document_sizes(mock_paperless_client, docs)
+
+        mock_paperless_client.get_document_sizes_batch.assert_called_once_with([1, 2])
+        store.assert_called_once()
+
+        cache = get_cache()
+        assert cache.get_size(1, docs[0].modified) == 111
+
+    def test_each_chunk_is_persisted_before_the_next(
+        self, mock_paperless_client: AsyncMock
+    ) -> None:
+        """Measurements are written per chunk, not once at the end.
+
+        This is what makes a share bigger than one client timeout converge: a
+        client that disconnects mid-listing still leaves behind everything
+        measured so far, so its next attempt resumes instead of starting over.
+        Here the second chunk fails outright, and the first chunk's work must
+        still have been persisted.
+        """
+        docs = self._docs(SIZE_PROBE_CHUNK + 20)
+        calls: list[list[int]] = []
+
+        def measure(chunk: list[int], **kwargs: Any) -> dict[int, int]:
+            calls.append(chunk)
+            if len(calls) == 1:
+                return {doc_id: doc_id * 10 for doc_id in chunk}
+            raise RuntimeError("paperless went away mid-listing")
+
+        mock_paperless_client.get_document_sizes_batch.side_effect = measure
+
+        with (
+            patch("paperless_webdav.webdav_provider.load_sizes", return_value={}),
+            patch("paperless_webdav.webdav_provider.store_sizes") as store,
+        ):
+            # The failure must not propagate -- a listing degrades, it does not break.
+            prefetch_document_sizes(mock_paperless_client, docs)
+
+        assert len(calls) == 2
+        assert len(calls[0]) == SIZE_PROBE_CHUNK
+        # The first chunk was banked before the second was attempted.
+        store.assert_called_once()
+        persisted = store.call_args[0][0]
+        assert len(persisted) == SIZE_PROBE_CHUNK
+        assert persisted[1] == 10
+
+    def test_store_failure_degrades_to_measuring(self, mock_paperless_client: AsyncMock) -> None:
+        """A store that cannot be read falls back to Paperless, not an error."""
+        docs = self._docs(2)
+        mock_paperless_client.get_document_sizes_batch.return_value = {1: 11, 2: 22}
+
+        with (
+            patch("paperless_webdav.webdav_provider.load_sizes", return_value={}),
+            patch("paperless_webdav.webdav_provider.store_sizes") as store,
+        ):
+            prefetch_document_sizes(mock_paperless_client, docs)
+
+        mock_paperless_client.get_document_sizes_batch.assert_called_once()
+        store.assert_called_once()

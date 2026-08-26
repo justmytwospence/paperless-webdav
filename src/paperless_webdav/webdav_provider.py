@@ -26,6 +26,7 @@ from paperless_webdav.async_bridge import run_async
 from paperless_webdav.cache import get_cache
 from paperless_webdav.logging import get_logger
 from paperless_webdav.paperless_client import PaperlessClient, PaperlessDocument
+from paperless_webdav.services.document_sizes import load_sizes, store_sizes
 
 # Type alias for clarity
 DocumentList = list[PaperlessDocument]
@@ -101,56 +102,89 @@ def _load_documents_cached(
     return documents
 
 
+# How many documents to measure per round trip before persisting. Sizes are
+# stored per chunk rather than once at the end so that a client which gives up
+# mid-listing still leaves behind everything measured so far -- see the comment
+# in prefetch_document_sizes. Chunking costs nothing: concurrency is applied
+# within each chunk, so the total wall time is unchanged.
+SIZE_PROBE_CHUNK = 100
+
+
 def prefetch_document_sizes(
     client: PaperlessClient, documents: DocumentList, ttl: float | None = None
 ) -> None:
-    """Pre-fetch and cache sizes for all documents concurrently.
+    """Ensure sizes for all documents are known, measuring only what is missing.
 
-    This issues concurrent /metadata/ requests for all documents to populate
-    the size cache, avoiding sequential requests during PROPFIND.
+    Three layers, cheapest first: the process-local cache, the durable
+    document_sizes table, and finally Paperless itself. Only the last is
+    expensive, and its results are persisted so that no size is ever measured
+    twice.
 
     Args:
         client: The PaperlessClient to use
-        documents: List of documents to pre-fetch sizes for
-        ttl: Seconds to cache each size for; None uses the cache default.
+        documents: List of documents to ensure sizes for
+        ttl: Seconds to cache each size in memory for; None uses the default.
     """
     if not documents:
         return
 
     cache = get_cache()
 
-    # Filter out documents whose sizes are already cached. Sizes are versioned
-    # by `modified`, so an edited document misses here and is re-probed even if
-    # its previous size is still within TTL.
+    # Sizes are versioned by `modified`, so an edited document misses at every
+    # layer and is re-measured even if its previous size is still around.
     versions = {doc.id: doc.modified for doc in documents}
-    doc_ids_to_fetch = [doc.id for doc in documents if cache.get_size(doc.id, doc.modified) is None]
 
-    if not doc_ids_to_fetch:
+    missing = [doc.id for doc in documents if cache.get_size(doc.id, doc.modified) is None]
+    if not missing:
         logger.debug("prefetch_all_cached", total=len(documents))
+        return
+
+    # The durable store. This is what makes a restart cheap and, more
+    # importantly, what lets an interrupted listing resume: work paid for by an
+    # earlier attempt -- even one the client abandoned -- is still here.
+    stored = load_sizes(missing)
+    to_measure: list[int] = []
+    for doc_id in missing:
+        entry = stored.get(doc_id)
+        if entry is not None and entry[0] == versions.get(doc_id):
+            cache.set_size(doc_id, entry[1], ttl=ttl, version=versions.get(doc_id))
+        else:
+            to_measure.append(doc_id)
+
+    if not to_measure:
+        logger.debug("prefetch_served_from_store", total=len(documents), restored=len(stored))
         return
 
     logger.debug(
         "prefetch_starting",
         total=len(documents),
-        to_fetch=len(doc_ids_to_fetch),
+        from_store=len(missing) - len(to_measure),
+        to_measure=len(to_measure),
     )
 
-    try:
-        # Fetch sizes concurrently
-        sizes = run_async(client.get_document_sizes_batch(doc_ids_to_fetch))
+    # Whatever is left has to be measured against Paperless, one request per
+    # document. Persist each chunk before starting the next: a large share can
+    # take longer to measure than a WebDAV client will wait, and if a
+    # disconnect discarded the whole batch the client could never make progress
+    # no matter how often it retried. Chunked writes turn that into a resumable
+    # walk that converges across attempts.
+    measured = 0
+    for start in range(0, len(to_measure), SIZE_PROBE_CHUNK):
+        chunk = to_measure[start : start + SIZE_PROBE_CHUNK]
+        try:
+            sizes = run_async(client.get_document_sizes_batch(chunk))
+            for doc_id, size in sizes.items():
+                cache.set_size(doc_id, size, ttl=ttl, version=versions.get(doc_id))
+            store_sizes(sizes, versions)
+            measured += len(sizes)
+        except Exception as e:
+            # A listing degrades to "sizes unknown", it never breaks. Whatever
+            # earlier chunks already persisted still stands, so the next attempt
+            # picks up from there rather than starting over.
+            logger.warning("prefetch_failed", measured=measured, error=str(e))
+            return
 
-        # Cache all fetched sizes
-        for doc_id, size in sizes.items():
-            cache.set_size(doc_id, size, ttl=ttl, version=versions.get(doc_id))
-
-        logger.debug(
-            "prefetch_complete",
-            requested=len(doc_ids_to_fetch),
-            fetched=len(sizes),
-        )
-    except Exception as e:
-        # Don't fail document listing if prefetch fails
-        logger.warning("prefetch_failed", error=str(e))
+    logger.debug("prefetch_complete", requested=len(to_measure), measured=measured)
 
 
 if TYPE_CHECKING:

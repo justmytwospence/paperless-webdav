@@ -6,7 +6,17 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, LargeBinary, String, Text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    LargeBinary,
+    String,
+    Text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, validates
@@ -28,6 +38,41 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class DocumentSize(Base):
+    """The number of bytes Paperless will serve for a document.
+
+    Deliberately not part of the cache layer, because it is not cache-shaped.
+    Paperless exposes size only via /api/documents/{id}/metadata/ -- one request
+    per document, which parses the file to extract ~30 metadata fields just to
+    return a byte count, and which a single instance serves at roughly 25/s no
+    matter how much concurrency is aimed at it. On a share of a few hundred
+    documents that is tens of seconds of fan-out, longer than a WebDAV client
+    will wait, so it cannot be paid on the request path.
+
+    But for a given (document, version) the answer is immutable -- the same file
+    is the same number of bytes forever. That is precisely what made a TTL the
+    wrong tool: expiry can only discard a correct answer and force the entire
+    fan-out to be repaid, which on a large share means repaying it into a client
+    that has already given up. So sizes are stored, not cached, and each one is
+    measured exactly once.
+    """
+
+    __tablename__ = "document_sizes"
+
+    document_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Paperless' `modified` for the revision this size was measured from. A
+    # re-OCR moves it, which supersedes the row rather than letting a stale
+    # Content-Length be served into a streamed download. One row per document:
+    # superseded revisions are overwritten, so this cannot grow per edit.
+    version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
