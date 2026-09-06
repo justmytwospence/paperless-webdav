@@ -292,8 +292,17 @@ def create_webdav_app(
             "re_encode_path_info": True,
             # Don't force unquote (let WSGI framework handle it)
             "unquote_path_info": False,
-            # Accept 'OPTIONS /' as 'OPTIONS *' for WinXP/Vista compatibility
-            "treat_root_options_as_asterisk": True,
+            # Accept 'OPTIONS /' as 'OPTIONS *' for WinXP/Vista compatibility.
+            #
+            # Must stay False. wsgidav's request_resolver sets is_asterisk_options
+            # for ANY method when PATH_INFO == "/" while this is on, not just
+            # OPTIONS -- so PROPFIND / short-circuits to an empty "200 OK" in
+            # ~1ms without ever resolving the share list. That makes the server
+            # root unbrowsable: a client mounting https://host/ sees nothing and
+            # every share has to be mounted by its own full URL. The WinXP
+            # compatibility this buys is worth nothing here and cost us the
+            # root listing.
+            "treat_root_options_as_asterisk": False,
         },
         # Store references for request handlers
         "paperless_url": paperless_url,
