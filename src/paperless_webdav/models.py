@@ -80,6 +80,44 @@ class DocumentSize(Base):
     )
 
 
+class AnnotatedUpload(Base):
+    """One spooled PUT: an annotated PDF pushed back by a reading device.
+
+    Purely an index. The spool directory and its JSON sidecars are the system
+    of record, so this table can be dropped and rebuilt without losing a byte --
+    which is deliberate, because the bridge's database is not in the backup set
+    while the spool directory is.
+
+    Keyed by the md5 of the uploaded bytes: that md5 IS the identity of the
+    annotation state, so a repeat sync of an unchanged file is recognised and
+    discarded before any Paperless traffic.
+    """
+
+    __tablename__ = "annotated_uploads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    spool_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Unique: the whole idempotency scheme rests on this constraint.
+    md5: Mapped[str] = mapped_column(String(32), nullable=False, unique=True, index=True)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Which document the bytes were judged to come from, and how confidently.
+    # Never taken from the request path alone -- see spool.attribute_source.
+    source_document_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_confidence: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Set once Paperless has ingested the upload as a new document.
+    paperless_document_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The previous annotated revision this one replaces, trashed after verify.
+    superseded_document_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    ingested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Share(Base):
     """Share configuration for tag-filtered WebDAV access."""
 

@@ -1,6 +1,7 @@
 """Application configuration via environment variables."""
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings
@@ -59,6 +60,43 @@ class Settings(BaseSettings):
             "instead of buffering the full archive first. Lower TTFB and memory; "
             "skips the in-memory content cache."
         ),
+    )
+    webdav_write_back: Literal["off", "spool", "ingest"] = Field(
+        default="off",
+        description=(
+            "What to do with a PUT to a document. 'off' rejects it with 403 -- "
+            "honest, and the safe default. 'spool' streams the body to "
+            "WEBDAV_SPOOL_DIR and fsyncs before answering, so an annotated PDF "
+            "from an e-reader survives even if Paperless is down. 'ingest' "
+            "additionally posts spooled files to Paperless as new documents "
+            "linked to the original. Never 'apply' -- Paperless 2.x has no "
+            "in-place file replacement, and the request path cannot be trusted "
+            "to name the right document anyway (see spool.attribute_source)."
+        ),
+    )
+    webdav_spool_dir: str = Field(
+        default="/spool",
+        description=(
+            "Directory for spooled uploads. Must be on a filesystem that is in "
+            "the backup set -- it holds the only copy of an annotation between "
+            "the PUT and a successful Paperless ingest."
+        ),
+    )
+    webdav_max_upload_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        description=(
+            "Reject a PUT larger than this with 507. Nothing else caps request "
+            "bodies at any layer here (cheroot's max_request_body_size is 0 and "
+            "Traefik sets no limit), so without this a client could fill the disk."
+        ),
+    )
+    webdav_spool_max_bytes: int = Field(
+        default=5 * 1024 * 1024 * 1024,
+        description="Refuse new uploads once the spool tree exceeds this many bytes.",
+    )
+    webdav_spool_retain_days: int = Field(
+        default=7,
+        description="Days to keep successfully ingested spool files before pruning.",
     )
     webdav_tag_folders: bool = Field(
         default=False,
