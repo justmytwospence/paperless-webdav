@@ -3068,3 +3068,54 @@ class TestDocumentSizeStore:
 
         mock_paperless_client.get_document_sizes_batch.assert_called_once()
         store.assert_called_once()
+
+
+class TestDocumentWriteRejected:
+    """Documents are read-only over WebDAV; PUT must fail loudly, not silently."""
+
+    def test_begin_write_raises_forbidden(
+        self,
+        mock_environ_with_token: dict[str, Any],
+        mock_paperless_client: AsyncMock,
+    ) -> None:
+        """PUT on a document returns 403 rather than swallowing the bytes.
+
+        Regression test: begin_write used to return a throwaway BytesIO and
+        end_write was a no-op, so an e-reader saving an annotated PDF got
+        204 No Content and lost the annotations with no error anywhere.
+        """
+        from wsgidav.dav_error import DAVError  # type: ignore[import-untyped]
+
+        mock_share = MagicMock()
+        mock_share.name = "inbox"
+        mock_share.include_tags = ["inbox"]
+        mock_share.exclude_tags = []
+        mock_share.done_folder_enabled = False
+
+        mock_doc = PaperlessDocument(
+            id=42,
+            title="Doc",
+            original_file_name="doc.pdf",
+            created="2025-01-15T10:00:00Z",
+            modified="2025-01-15T10:00:00Z",
+            tags=[1],
+        )
+
+        provider = PaperlessProvider(
+            shares={"inbox": mock_share},
+            paperless_url="http://paperless.local",
+        )
+
+        with patch.object(provider, "_create_client", return_value=mock_paperless_client):
+            resource = DocumentResource(
+                "/inbox/Doc.pdf",
+                mock_environ_with_token,
+                provider,
+                mock_doc,
+                share=mock_share,
+            )
+
+            with pytest.raises(DAVError) as exc_info:
+                resource.begin_write(content_type="application/pdf")
+
+            assert exc_info.value.value == 403

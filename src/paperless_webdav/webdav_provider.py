@@ -1353,18 +1353,31 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         return True
 
     def begin_write(self, content_type: str | None = None) -> io.BytesIO:
-        """Accept write but discard content.
+        """Reject writes to a document.
 
-        macOS Finder sometimes tries to write to files when opening them
-        (e.g., updating metadata). We accept but discard this to prevent
-        403 errors that confuse Finder.
+        This used to accept the PUT and throw the bytes away, so that macOS
+        Finder's metadata writes would not 403 and confuse it. That silently
+        traded a cosmetic Finder annoyance for real data loss: an e-reader
+        saving an annotated PDF back over WebDAV got 204 No Content and the
+        annotations vanished, with only a debug line to show for it.
+
+        There is no write-back path to Paperless here -- this bridge is
+        read-only -- so the honest answer is 403. A client that is told no can
+        keep the user's work; a client that is told 204 discards it.
+
+        macOS dot-underscore sidecar files are a separate resource class
+        (MacOSMetadataResource) and still swallow writes, so the original
+        Finder workaround is preserved where it actually applied.
         """
-        logger.debug("document_write_discarded", document_id=self.document.id)
-        return io.BytesIO()
+        from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN  # type: ignore[import-untyped]
 
-    def end_write(self, with_errors: bool) -> None:
-        """Complete the write (data is discarded)."""
-        pass
+        logger.warning(
+            "document_write_rejected",
+            document_id=self.document.id,
+            path=self.path,
+            content_type=content_type,
+        )
+        raise DAVError(HTTP_FORBIDDEN, "Documents are read-only over WebDAV")
 
     @staticmethod
     def _parse_iso_datetime(iso_string: str) -> datetime:
@@ -1568,7 +1581,15 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
             # Gracefully degrade if no client available (already logged)
             return False
 
-        # No-op for other moves (same location)
+        # No-op for other moves (same location).
+        #
+        # NOTE: this accepts renames it cannot actually perform -- a client
+        # renaming Doc.pdf to Renamed.pdf gets a success it will lose on the
+        # next listing refresh. That is deliberate (see
+        # test_move_allows_same_location_rename) and kept: erroring here breaks
+        # graceful degradation when the done folder is disabled or share info
+        # is missing. Revisit only alongside a real rename path (title edit via
+        # the Paperless API), not as a bare 403.
         logger.debug(
             "move_no_tag_change",
             document_id=self.document.id,
@@ -1625,7 +1646,15 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
             # Gracefully degrade if no client available (already logged)
             return False
 
-        # No-op for other moves (same location)
+        # No-op for other moves (same location).
+        #
+        # NOTE: this accepts renames it cannot actually perform -- a client
+        # renaming Doc.pdf to Renamed.pdf gets a success it will lose on the
+        # next listing refresh. That is deliberate (see
+        # test_move_allows_same_location_rename) and kept: erroring here breaks
+        # graceful degradation when the done folder is disabled or share info
+        # is missing. Revisit only alongside a real rename path (title edit via
+        # the Paperless API), not as a bare 403.
         logger.debug(
             "move_no_tag_change",
             document_id=self.document.id,
