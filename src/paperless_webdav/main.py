@@ -105,6 +105,7 @@ def run_servers() -> None:
         stream_downloads=settings.webdav_stream_downloads,
         document_list_ttl=settings.webdav_document_list_ttl,
         size_ttl=settings.webdav_size_ttl,
+        tag_folders=settings.webdav_tag_folders,
     )
 
     # Run WebDAV server in background thread

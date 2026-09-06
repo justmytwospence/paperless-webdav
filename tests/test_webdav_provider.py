@@ -12,11 +12,13 @@ from paperless_webdav.cache import get_cache
 from paperless_webdav.paperless_client import PaperlessDocument, PaperlessTag
 from paperless_webdav.webdav_provider import (
     SIZE_PROBE_CHUNK,
+    UNSORTED_FOLDER_NAME,
     DocumentResource,
     DoneFolderResource,
     PaperlessProvider,
     RootResource,
     ShareResource,
+    TagFolderResource,
     prefetch_document_sizes,
     sanitize_filename,
 )
@@ -3119,3 +3121,111 @@ class TestDocumentWriteRejected:
                 resource.begin_write(content_type="application/pdf")
 
             assert exc_info.value.value == 403
+
+
+class TestTagFolders:
+    """Share root becomes one folder per tag; documents appear under each of theirs."""
+
+    def _provider(self, mock_share: Any, tag_folders: bool = True) -> PaperlessProvider:
+        return PaperlessProvider(
+            shares={"academic": mock_share},
+            paperless_url="http://paperless.local",
+            tag_folders=tag_folders,
+        )
+
+    def _share(self) -> Any:
+        mock_share = MagicMock()
+        mock_share.name = "academic"
+        mock_share.include_tags = ["academic"]
+        mock_share.exclude_tags = []
+        mock_share.done_folder_enabled = False
+        mock_share.done_folder_name = "done"
+        mock_share.done_tag = None
+        return mock_share
+
+    def _docs(self) -> list[PaperlessDocument]:
+        # tag 1 = academic (the share tag), 2 = philosophy, 3 = bayesian
+        def doc(doc_id: int, title: str, tags: list[int]) -> PaperlessDocument:
+            return PaperlessDocument(
+                id=doc_id,
+                title=title,
+                original_file_name=f"{title}.pdf",
+                created="2025-01-15T10:00:00Z",
+                modified="2025-01-15T10:00:00Z",
+                tags=tags,
+            )
+
+        return [
+            doc(1, "Bat", [1, 2, 3]),  # both topic folders
+            doc(2, "Priors", [1, 3]),  # bayesian only
+            doc(3, "Loose", [1]),  # no topic tag -> unsorted
+        ]
+
+    def test_share_root_lists_tag_folders_not_documents(
+        self, mock_environ_with_token: dict[str, Any]
+    ) -> None:
+        """The root shows folders plus unsorted, and no bare PDFs."""
+        mock_share = self._share()
+        provider = self._provider(mock_share)
+
+        with (
+            patch.object(ShareResource, "_load_documents", return_value=self._docs()),
+            patch.object(
+                ShareResource,
+                "_get_tag_map",
+                return_value={"academic": 1, "philosophy": 2, "bayesian": 3},
+            ),
+            patch.object(provider, "_create_client", return_value=MagicMock()),
+        ):
+            resource = ShareResource("/academic", mock_environ_with_token, provider, mock_share)
+            names = resource.get_member_names()
+
+        # the share's own tag is not a folder -- every document carries it
+        assert "academic" not in names
+        assert set(names) == {"bayesian", "philosophy", UNSORTED_FOLDER_NAME}
+        assert not [n for n in names if n.endswith(".pdf")]
+
+    def test_document_appears_in_every_matching_folder(
+        self, mock_environ_with_token: dict[str, Any]
+    ) -> None:
+        """Many-to-many tags survive: one document, two folders, no duplication."""
+        mock_share = self._share()
+        provider = self._provider(mock_share)
+
+        with (
+            patch.object(ShareResource, "_load_documents", return_value=self._docs()),
+            patch.object(
+                ShareResource,
+                "_get_tag_map",
+                return_value={"academic": 1, "philosophy": 2, "bayesian": 3},
+            ),
+            patch.object(provider, "_create_client", return_value=MagicMock()),
+        ):
+            share_resource = ShareResource(
+                "/academic", mock_environ_with_token, provider, mock_share
+            )
+            philosophy = share_resource.get_member("philosophy")
+            bayesian = share_resource.get_member("bayesian")
+            unsorted = share_resource.get_member(UNSORTED_FOLDER_NAME)
+
+            assert isinstance(philosophy, TagFolderResource)
+            assert philosophy.get_member_names() == ["Bat.pdf"]
+            # same document, second folder, identical filename
+            assert "Bat.pdf" in bayesian.get_member_names()
+            assert "Priors.pdf" in bayesian.get_member_names()
+            # only the document with no topic tag
+            assert unsorted.get_member_names() == ["Loose.pdf"]
+
+    def test_disabled_keeps_flat_listing(self, mock_environ_with_token: dict[str, Any]) -> None:
+        """With the flag off the share root is unchanged."""
+        mock_share = self._share()
+        provider = self._provider(mock_share, tag_folders=False)
+
+        with (
+            patch.object(ShareResource, "_load_documents", return_value=self._docs()),
+            patch.object(provider, "_create_client", return_value=MagicMock()),
+        ):
+            resource = ShareResource("/academic", mock_environ_with_token, provider, mock_share)
+            names = resource.get_member_names()
+
+        assert set(names) == {"Bat.pdf", "Priors.pdf", "Loose.pdf"}
