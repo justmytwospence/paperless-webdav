@@ -106,6 +106,11 @@ def run_servers() -> None:
         document_list_ttl=settings.webdav_document_list_ttl,
         size_ttl=settings.webdav_size_ttl,
         tag_folders=settings.webdav_tag_folders,
+        write_back=settings.webdav_write_back,
+        spool_dir=settings.webdav_spool_dir,
+        max_upload_bytes=settings.webdav_max_upload_bytes,
+        spool_max_bytes=settings.webdav_spool_max_bytes,
+        spool_retain_days=settings.webdav_spool_retain_days,
     )
 
     # Run WebDAV server in background thread

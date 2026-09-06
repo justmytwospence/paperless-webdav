@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider  # type: ignore[import-untyped]
@@ -27,6 +28,16 @@ from paperless_webdav.cache import get_cache
 from paperless_webdav.logging import get_logger
 from paperless_webdav.paperless_client import PaperlessClient, PaperlessDocument
 from paperless_webdav.services.document_sizes import load_sizes, store_sizes
+from paperless_webdav.spool import (
+    SPOOL_SUBDIRS,
+    SpooledFile,
+    SpooledUpload,
+    attribute_source,
+    prune_ingested,
+    spool_dirs,
+    spool_usage_bytes,
+    sweep_on_start,
+)
 
 # Type alias for clarity
 DocumentList = list[PaperlessDocument]
@@ -326,6 +337,12 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
         document_list_ttl: int = 0,
         size_ttl: int = 300,
         tag_folders: bool = False,
+        write_back: str = "off",
+        spool_dir: str | None = None,
+        max_upload_bytes: int = 256 * 1024 * 1024,
+        spool_max_bytes: int = 5 * 1024 * 1024 * 1024,
+        annotation_tag: str = "zz-annotated-copy",
+        spool_retain_days: int = 7,
     ) -> None:
         """Initialize the provider.
 
@@ -354,6 +371,31 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
         self._document_list_ttl: int = document_list_ttl
         self._size_ttl: int = size_ttl
         self._tag_folders: bool = tag_folders
+        self._write_back: str = write_back
+        self._spool_root: Path | None = Path(spool_dir) if spool_dir else None
+        self._max_upload_bytes: int = max_upload_bytes
+        self._spool_max_bytes: int = spool_max_bytes
+        self._annotation_tag_name: str = annotation_tag
+
+        # Create the spool tree here rather than at some startup call site, so
+        # that it exists for every construction path -- including the ones the
+        # tests use. Without this the directories are only ever made by the
+        # test fixture, and the first real PUT dies with FileNotFoundError
+        # after the client has already spent 38 seconds uploading.
+        if self._write_back != "off" and self._spool_root is not None:
+            try:
+                spool_dirs(self._spool_root)
+                sweep_on_start(self._spool_root)
+                prune_ingested(self._spool_root, spool_retain_days)
+            except OSError as exc:
+                # Fail loudly at startup rather than at 2am mid-upload.
+                logger.error(
+                    "spool_unusable",
+                    path=str(self._spool_root),
+                    write_back=self._write_back,
+                    error=str(exc),
+                )
+                raise
         # Build filename-to-document mapping for each share (static mode)
         self._doc_by_filename: dict[str, dict[str, PaperlessDocument]] = {}
         self._build_filename_index()
@@ -503,6 +545,102 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
 
         logger.debug("resource_not_found", path=path)
         return None
+
+    # -- write-back support -------------------------------------------------
+
+    def _annotation_tag_ids(self, environ: dict[str, Any]) -> set[int]:
+        """Tag ids for the annotation marker tag, empty if it does not exist.
+
+        Resolved by name rather than id: ids are Paperless state and must not be
+        pinned in configuration. A missing tag is not an error -- it simply means
+        no annotated copies exist yet.
+        """
+        if not self._annotation_tag_name:
+            return set()
+        client = self._create_client(environ)
+        if client is None:
+            return set()
+        try:
+            cache = get_cache()
+            token = environ.get("paperless.token")
+            tag_map = cache.get_tag_map(token) if token else None
+            if tag_map is None:
+                tag_map = {tag.name: tag.id for tag in run_async(client.get_tags())}
+                if token:
+                    cache.set_tag_map(token, tag_map)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("annotation_tag_lookup_failed", error=str(exc))
+            return set()
+
+        tag_id = tag_map.get(self._annotation_tag_name)
+        return {tag_id} if tag_id is not None else set()
+
+    def _share_document_sizes(self, environ: dict[str, Any], share: Share | None) -> dict[int, int]:
+        """{document_id: stored size} for attributing an upload by its bytes.
+
+        Loads the share's documents the way a listing does -- NOT via
+        get_documents_for_share, which reads the static _documents_by_share map
+        that is empty in every dynamic deployment. Reading the static map here
+        silently produced an empty candidate set, so every upload fell through
+        to the request path: the untrusted identity whose failure this
+        attribution exists to prevent.
+
+        Sizes come from the durable document_sizes table, and only rows whose
+        stored version still matches the document's `modified` are used -- a
+        size measured before a re-OCR describes different bytes, and would
+        attribute an upload to the wrong paper with full confidence.
+        """
+        if share is None:
+            return {}
+        try:
+            share_resource = ShareResource(f"/{share.name}", environ, self, share)
+            documents = share_resource._get_documents(prefetch_sizes=False)
+            if not documents:
+                return {}
+
+            versions = {doc.id: doc.modified for doc in documents}
+            stored = load_sizes(list(versions))
+            sizes: dict[int, int] = {}
+            # load_sizes yields (version, size) -- version first.
+            for doc_id, (version, size) in stored.items():
+                if not size:
+                    continue
+                if version is not None and version != versions.get(doc_id):
+                    continue
+                sizes[doc_id] = size
+            return sizes
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("share_document_sizes_failed", error=str(exc))
+            return {}
+
+    def _upload_already_held(self, md5: str) -> bool:
+        """Whether these exact bytes are provably still held somewhere.
+
+        The md5 of an upload is the identity of the annotation state, so a
+        repeat sync of an unchanged file should be a no-op. But "this md5 has
+        been seen" is not the same as "these bytes still exist": if an earlier
+        ingest failed and its spool file was later cleared, discarding the
+        re-upload on the strength of a database row alone would throw away the
+        last remaining copy. Require proof, and default to keeping the bytes.
+        """
+        from paperless_webdav.services.annotations import upload_ingested
+
+        if upload_ingested(md5):
+            return True
+
+        if self._spool_root is None:
+            return False
+        for name in SPOOL_SUBDIRS:
+            directory = self._spool_root / name
+            if directory.is_dir() and any(directory.glob(f"*{md5[:12]}*")):
+                return True
+        return False
+
+    def _record_spooled_upload(self, spooled: SpooledFile) -> None:
+        """Index a completed upload. Best-effort: the spool is authoritative."""
+        from paperless_webdav.services.annotations import record_pending
+
+        record_pending(spooled)
 
     def get_documents_for_share(self, share_name: str) -> list[PaperlessDocument]:
         """Get documents for a specific share.
@@ -1331,6 +1469,8 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         self._content: bytes | None = None
         # Cache for file size (from HEAD request)
         self._file_size: int | None = None
+        # In-flight PUT sink, set by begin_write and consumed by end_write
+        self._upload: SpooledUpload | None = None
 
     def get_display_name(self) -> str:
         """Return the document filename for display.
@@ -1568,32 +1708,161 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         """
         return True
 
-    def begin_write(self, content_type: str | None = None) -> io.BytesIO:
-        """Reject writes to a document.
+    def begin_write(self, content_type: str | None = None) -> Any:
+        """Accept a PUT into the spool, or refuse it -- but never discard it.
 
-        This used to accept the PUT and throw the bytes away, so that macOS
-        Finder's metadata writes would not 403 and confuse it. That silently
-        traded a cosmetic Finder annoyance for real data loss: an e-reader
-        saving an annotated PDF back over WebDAV got 204 No Content and the
-        annotations vanished, with only a debug line to show for it.
+        This used to return a throwaway io.BytesIO and answer 204, so an
+        e-reader saving an annotated PDF was told "saved" while the bytes were
+        freed. That is not a hypothetical: on 2026-09-06 a 52,421,533-byte
+        upload -- doc 721 plus a 3,538-byte annotation layer -- was destroyed
+        exactly this way after a 38-second transfer.
 
-        There is no write-back path to Paperless here -- this bridge is
-        read-only -- so the honest answer is 403. A client that is told no can
-        keep the user's work; a client that is told 204 discards it.
+        Crucially the bytes are NOT written to the document at this path. The
+        filename index is an exact-match dict, so "Bayesian Workflow.pdf" and
+        "Bayesian workflow.pdf" are two server paths that collapse to one file
+        on a case-insensitive client; that upload arrived on doc 698's path
+        carrying doc 721's content. Applying it here would have replaced an
+        unrelated 8 MB paper with 52 MB of something else. Attribution happens
+        in end_write, from the bytes.
 
-        macOS dot-underscore sidecar files are a separate resource class
-        (MacOSMetadataResource) and still swallow writes, so the original
-        Finder workaround is preserved where it actually applied.
+        With write-back off the answer is 403 -- honest, and a client told "no"
+        keeps the user's work. macOS dot-underscore sidecars are a separate
+        resource class and still swallow writes.
         """
-        from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN  # type: ignore[import-untyped]
+        from wsgidav.dav_error import (  # type: ignore[import-untyped]
+            HTTP_FORBIDDEN,
+            HTTP_INSUFFICIENT_STORAGE,
+            DAVError,
+        )
 
-        logger.warning(
-            "document_write_rejected",
+        mode = getattr(self._provider, "_write_back", "off")
+
+        if mode == "off":
+            logger.warning(
+                "document_write_rejected",
+                document_id=self.document.id,
+                path=self.path,
+                content_type=content_type,
+            )
+            raise DAVError(HTTP_FORBIDDEN, "Documents are read-only over WebDAV")
+
+        # Loop guard: never accept a write to an annotated copy. Without this an
+        # annotated document that somehow reached a client could be annotated
+        # again and spawn a chain of revisions of revisions.
+        annotation_tag_ids = self._provider._annotation_tag_ids(self.environ)
+        if annotation_tag_ids and set(self.document.tags) & annotation_tag_ids:
+            logger.warning(
+                "document_write_rejected_annotated_copy",
+                document_id=self.document.id,
+                path=self.path,
+            )
+            raise DAVError(HTTP_FORBIDDEN, "Annotated copies are read-only")
+
+        root = self._provider._spool_root
+        if root is None:  # pragma: no cover - guarded by config validation
+            raise DAVError(HTTP_FORBIDDEN, "Write-back is enabled but no spool directory is set")
+
+        if self._provider._spool_max_bytes:
+            used = spool_usage_bytes(root)
+            if used >= self._provider._spool_max_bytes:
+                logger.error("spool_full", used=used, limit=self._provider._spool_max_bytes)
+                raise DAVError(HTTP_INSUFFICIENT_STORAGE, "Upload spool is full")
+
+        self._upload = SpooledUpload(
+            root,
+            request_path=self.path,
+            path_document_id=self.document.id,
+            username=self.environ.get("wsgidav.auth.user_name"),
+            max_bytes=self._provider._max_upload_bytes,
+        )
+        logger.info(
+            "document_write_spooling",
             document_id=self.document.id,
             path=self.path,
-            content_type=content_type,
+            spool_id=self._upload.spool_id,
         )
-        raise DAVError(HTTP_FORBIDDEN, "Documents are read-only over WebDAV")
+        return self._upload
+
+    def end_write(self, *, with_errors: bool) -> None:
+        """Publish the spooled upload, or drop it if the transfer failed.
+
+        Keyword-only to match DAVNonCollection.end_write. Runs after wsgidav has
+        already called close() on the sink -- which is why SpooledUpload.close()
+        fsyncs without releasing the descriptor.
+        """
+        upload = self._upload
+        self._upload = None
+        if upload is None:
+            return
+
+        if with_errors:
+            logger.warning("document_write_aborted", document_id=self.document.id, path=self.path)
+            upload.abort()
+            return
+
+        # A short body must never be answered 204. wsgidav does not check this:
+        # _stream_data loops until read() returns b"" and then sets
+        # all_input_read unconditionally, and cheroot's KnownLengthRFile never
+        # asserts that `remaining` reached zero -- so a client that drops with a
+        # graceful FIN mid-upload is indistinguishable from a clean EOF, and
+        # with_errors stays False. Without this check a half-delivered PDF is
+        # published as a complete annotation and the device is told "saved":
+        # precisely the failure this module exists to remove.
+        expected = self.environ.get("CONTENT_LENGTH")
+        try:
+            expected_size = int(expected) if expected else 0
+        except (TypeError, ValueError):
+            expected_size = 0
+
+        if expected_size and upload.size != expected_size:
+            # Retain, never unlink: the prefix we did receive may be the only
+            # copy of work the user has done.
+            upload.park("partial", f"expected {expected_size} bytes, received {upload.size}")
+            from wsgidav.dav_error import (  # type: ignore[import-untyped]
+                HTTP_BAD_REQUEST,
+                DAVError,
+            )
+
+            raise DAVError(HTTP_BAD_REQUEST, "Incomplete upload; body shorter than Content-Length")
+
+        if upload.size == 0:
+            upload.abort()
+            logger.warning("document_write_empty", document_id=self.document.id, path=self.path)
+            return
+
+        # A repeat sync of unchanged bytes is a no-op: same md5, nothing stored,
+        # no Paperless traffic. The body still crosses the wire because the
+        # client sends no Content-MD5, so this is the earliest it can be known.
+        #
+        # Only discard when the bytes are provably still held somewhere. A bare
+        # row is not proof: if a previous ingest failed and its spool file was
+        # since removed, discarding the re-upload on the strength of the row
+        # would throw away the last copy.
+        if self._provider._upload_already_held(upload.md5):
+            logger.info(
+                "document_write_duplicate_upload",
+                document_id=self.document.id,
+                md5=upload.md5,
+            )
+            upload.abort()
+            return
+
+        source_id, confidence = self._attribute_source(upload.size)
+        spooled = upload.finalize(
+            source_document_id=source_id,
+            source_confidence=confidence,
+            share_name=self._share.name if self._share else None,
+        )
+        self._provider._record_spooled_upload(spooled)
+
+    def _attribute_source(self, upload_size: int) -> tuple[int | None, str]:
+        """Identify which document the uploaded bytes came from.
+
+        Uses stored sizes for the share rather than the request path, because
+        the path demonstrably lies on case-insensitive clients.
+        """
+        candidates = self._provider._share_document_sizes(self.environ, self._share)
+        return attribute_source(upload_size, candidates, self.document.id)
 
     @staticmethod
     def _parse_iso_datetime(iso_string: str) -> datetime:

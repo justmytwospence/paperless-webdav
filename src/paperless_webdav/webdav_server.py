@@ -229,6 +229,12 @@ def create_webdav_app(
     document_list_ttl: int = 0,
     size_ttl: int = 300,
     tag_folders: bool = False,
+    write_back: str = "off",
+    spool_dir: str | None = None,
+    max_upload_bytes: int = 256 * 1024 * 1024,
+    spool_max_bytes: int = 5 * 1024 * 1024 * 1024,
+    annotation_tag: str = "zz-annotated-copy",
+    spool_retain_days: int = 7,
 ) -> WsgiDAVApp:
     """Create the wsgidav WSGI application.
 
@@ -256,6 +262,12 @@ def create_webdav_app(
         document_list_ttl=document_list_ttl,
         size_ttl=size_ttl,
         tag_folders=tag_folders,
+        write_back=write_back,
+        spool_dir=spool_dir,
+        max_upload_bytes=max_upload_bytes,
+        spool_max_bytes=spool_max_bytes,
+        annotation_tag=annotation_tag,
+        spool_retain_days=spool_retain_days,
     )
 
     # Create authenticator class that captures our configuration
@@ -355,6 +367,12 @@ class WebDAVServer:
         document_list_ttl: int = 0,
         size_ttl: int = 300,
         tag_folders: bool = False,
+        write_back: str = "off",
+        spool_dir: str | None = None,
+        max_upload_bytes: int = 256 * 1024 * 1024,
+        spool_max_bytes: int = 5 * 1024 * 1024 * 1024,
+        annotation_tag: str = "zz-annotated-copy",
+        spool_retain_days: int = 7,
     ) -> None:
         """Initialize the WebDAV server.
 
@@ -391,6 +409,12 @@ class WebDAVServer:
             document_list_ttl=document_list_ttl,
             size_ttl=size_ttl,
             tag_folders=tag_folders,
+            write_back=write_back,
+            spool_dir=spool_dir,
+            max_upload_bytes=max_upload_bytes,
+            spool_max_bytes=spool_max_bytes,
+            annotation_tag=annotation_tag,
+            spool_retain_days=spool_retain_days,
         )
         self._server = cheroot.wsgi.Server(
             (host, port),
