@@ -196,6 +196,12 @@ logger = get_logger(__name__)
 # Characters that are unsafe for filesystems (Windows, macOS, Linux)
 UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
 
+# Catch-all folder in tag-folder mode, for documents carrying no tag other
+# than the share's own include_tags. Without it those documents would be
+# unreachable once the share root stops listing documents directly. It
+# self-empties: tag a document and it moves to that tag's folder.
+UNSORTED_FOLDER_NAME = "unsorted"
+
 # macOS metadata file patterns
 MACOS_METADATA_PATTERNS = (
     ".DS_Store",
@@ -319,6 +325,7 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
         stream_downloads: bool = False,
         document_list_ttl: int = 0,
         size_ttl: int = 300,
+        tag_folders: bool = False,
     ) -> None:
         """Initialize the provider.
 
@@ -346,6 +353,7 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
         self._stream_downloads: bool = stream_downloads
         self._document_list_ttl: int = document_list_ttl
         self._size_ttl: int = size_ttl
+        self._tag_folders: bool = tag_folders
         # Build filename-to-document mapping for each share (static mode)
         self._doc_by_filename: dict[str, dict[str, PaperlessDocument]] = {}
         self._build_filename_index()
@@ -473,22 +481,24 @@ class PaperlessProvider(DAVProvider):  # type: ignore[misc]
             )
             return member
 
-        # Three-level path: /{share}/done/{document}
-        # Need to resolve the document within the done folder
+        # Three-level path: /{share}/{folder}/{document}, where {folder} is the
+        # done folder or a tag folder. Keyed off is_collection rather than a
+        # specific class so any future folder type resolves without touching
+        # this ladder again.
         if len(parts) == 3:
             logger.debug(
                 "resolve_three_level",
                 path=path,
                 member_type=type(member).__name__,
-                is_done_folder=isinstance(member, DoneFolderResource),
+                is_collection=getattr(member, "is_collection", False),
             )
-            if isinstance(member, DoneFolderResource):
+            if getattr(member, "is_collection", False):
                 doc_name = parts[2]
                 doc_resource = member.get_member(doc_name)
                 if doc_resource is not None:
                     doc_resource.path = path
                     return doc_resource
-                logger.debug("document_not_found_in_done", path=path, doc_name=doc_name)
+                logger.debug("document_not_found_in_folder", path=path, doc_name=doc_name)
                 return None
 
         logger.debug("resource_not_found", path=path)
@@ -630,11 +640,16 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
         logger.debug("fetched_and_cached_tag_map", tag_count=len(tag_map))
         return tag_map
 
-    def _load_documents(self) -> list[PaperlessDocument]:
+    def _load_documents(self, prefetch_sizes: bool = True) -> list[PaperlessDocument]:
         """Load documents from Paperless API or static cache.
 
         Attempts dynamic loading if a client can be created. Falls back
         to static documents_by_share if no client is available.
+
+        Args:
+            prefetch_sizes: Whether to warm the per-document size cache. Set
+                False when only tags or titles are needed, so a listing does
+                not pay the /metadata/ fan-out for members it never renders.
 
         Returns:
             List of documents for this share
@@ -675,15 +690,51 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
                 count=len(documents),
             )
 
-            # Pre-fetch all document sizes concurrently
-            prefetch_document_sizes(client, documents, ttl=self._provider._size_ttl)
+            # Pre-fetch all document sizes concurrently.
+            #
+            # Skipped when the share root is a folder listing: sizes come from
+            # a per-document /api/documents/{id}/metadata/ call that Paperless
+            # serves at roughly 25/s, so probing all 741 members of a share to
+            # render 12 folder names is pure latency -- and it is exactly the
+            # fan-out that makes slow clients give up mid-listing. Each folder
+            # prefetches only its own members when it is opened.
+            if prefetch_sizes:
+                prefetch_document_sizes(client, documents, ttl=self._provider._size_ttl)
 
             return documents
 
         # Fall back to static mode
         return self._provider.get_documents_for_share(self._share.name)
 
-    def _get_documents(self) -> list[PaperlessDocument]:
+    def _topic_tag_ids(self) -> dict[str, int]:
+        """Return {folder name: tag id} for the tags that become folders here.
+
+        Every tag present on the share's documents becomes a folder, except the
+        share's own include_tags -- by definition every document carries those,
+        so they would just re-list the whole share -- and the done_tag, which
+        already has its own folder. Derived live from Paperless, so a tag added
+        or renamed there needs no configuration on this side.
+        """
+        client = self._provider._create_client(self.environ)
+        if client is None:
+            return {}
+
+        excluded = {name.lower() for name in self._share.include_tags}
+        if self._share.done_folder_enabled and self._share.done_tag:
+            excluded.add(self._share.done_tag.lower())
+
+        present: set[int] = set()
+        for doc in self._get_documents(prefetch_sizes=False):
+            present.update(doc.tags)
+
+        tag_map = self._get_tag_map(client)
+        return {
+            name: tag_id
+            for name, tag_id in tag_map.items()
+            if tag_id in present and name.lower() not in excluded
+        }
+
+    def _get_documents(self, prefetch_sizes: bool = True) -> list[PaperlessDocument]:
         """Get documents for this share, caching for the request.
 
         When multiple documents have the same sanitized filename,
@@ -691,11 +742,14 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
         The document with the LOWEST ID always gets the base filename to ensure
         deterministic behavior across requests.
 
+        Args:
+            prefetch_sizes: Passed through to _load_documents on a cold load.
+
         Returns:
             List of documents for this share
         """
         if self._loaded_documents is None:
-            self._loaded_documents = self._load_documents()
+            self._loaded_documents = self._load_documents(prefetch_sizes=prefetch_sizes)
             # Build filename index with collision detection
             # Sort by ID to ensure deterministic collision resolution
             self._doc_by_filename = {}
@@ -748,6 +802,17 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
         if self._share.done_folder_enabled:
             members.append(self._share.done_folder_name)
 
+        # Tag-folder mode: the share root lists folders instead of documents.
+        # Every document is still reachable -- it appears under each of its
+        # tags, and anything left without one lands in UNSORTED_FOLDER_NAME --
+        # so nothing is hidden, the root just goes from hundreds of entries to
+        # a dozen.
+        if self._provider._tag_folders:
+            members.extend(sorted(self._topic_tag_ids()))
+            if self._untagged_documents():
+                members.append(UNSORTED_FOLDER_NAME)
+            return members
+
         # Ensure documents are loaded (this builds the filename index)
         self._get_documents()
 
@@ -756,6 +821,20 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
             members.extend(self._doc_by_filename.keys())
 
         return members
+
+    def _untagged_documents(self) -> list[PaperlessDocument]:
+        """Documents that would appear in no tag folder.
+
+        These carry only the share's include_tags (and possibly the done_tag),
+        so without a catch-all they would be unreachable once the root stops
+        listing documents directly.
+        """
+        folder_tag_ids = set(self._topic_tag_ids().values())
+        return [
+            doc
+            for doc in self._get_documents(prefetch_sizes=False)
+            if not (set(doc.tags) & folder_tag_ids)
+        ]
 
     def get_member(
         self, name: str
@@ -777,6 +856,18 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
             return DoneFolderResource(
                 f"{self.path}/{name}", self.environ, self._provider, self._share
             )
+
+        # Check for a tag folder (or the unsorted catch-all)
+        if self._provider._tag_folders:
+            if name == UNSORTED_FOLDER_NAME:
+                return TagFolderResource(
+                    f"{self.path}/{name}", self.environ, self._provider, self._share, tag_id=None
+                )
+            tag_id = self._topic_tag_ids().get(name)
+            if tag_id is not None:
+                return TagFolderResource(
+                    f"{self.path}/{name}", self.environ, self._provider, self._share, tag_id=tag_id
+                )
 
         # Check for document - try dynamic first, then static
         doc = self._get_doc_by_filename(name)
@@ -1078,6 +1169,131 @@ class DoneFolderResource(DAVCollection):  # type: ignore[misc]
         from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN  # type: ignore[import-untyped]
 
         raise DAVError(HTTP_FORBIDDEN, f"Cannot create files in done folder: {name}")
+
+
+class TagFolderResource(DAVCollection):  # type: ignore[misc]
+    """A read-only folder listing the share's documents that carry one tag.
+
+    This is a view, not a location. The same document appears in the folder of
+    every tag it carries, which is legal because WebDAV collections mint their
+    own hrefs -- so Paperless's many-to-many tags survive being presented as
+    folders, with nothing duplicated on disk and nothing written back.
+
+    With tag_id None this is the unsorted catch-all: documents carrying no tag
+    other than the share's own include_tags.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        environ: dict[str, Any],
+        provider: PaperlessProvider,
+        share: Share,
+        tag_id: int | None,
+    ) -> None:
+        """Initialize the tag folder.
+
+        Args:
+            path: The WebDAV path (e.g. "/academic/bayesian")
+            environ: WSGI environ dictionary
+            provider: The parent PaperlessProvider
+            share: The Share configuration object
+            tag_id: Tag to filter on, or None for the unsorted catch-all
+        """
+        super().__init__(path, environ)
+        self._provider = provider
+        self._share = share
+        self._tag_id = tag_id
+        self._doc_by_filename: dict[str, PaperlessDocument] | None = None
+
+    def get_display_name(self) -> str:
+        """Return the folder name for display."""
+        return self.path.rstrip("/").split("/")[-1]
+
+    def _share_resource(self) -> ShareResource:
+        """The parent share, used as the single source of documents.
+
+        Reusing it means a folder filters the share's document list rather than
+        issuing its own query; with WEBDAV_DOCUMENT_LIST_TTL set that list is
+        already warm, so opening a folder costs no extra Paperless round-trip.
+        """
+        share_path = "/" + self.path.strip("/").split("/")[0]
+        return ShareResource(share_path, self.environ, self._provider, self._share)
+
+    def _get_documents(self) -> dict[str, PaperlessDocument]:
+        """Filename -> document for the members of this folder."""
+        if self._doc_by_filename is not None:
+            return self._doc_by_filename
+
+        share_resource = self._share_resource()
+        if self._tag_id is None:
+            documents = share_resource._untagged_documents()
+        else:
+            documents = [
+                doc
+                for doc in share_resource._get_documents(prefetch_sizes=False)
+                if self._tag_id in doc.tags
+            ]
+
+        # Size probes are scoped to this folder's members. That is the whole
+        # point of folders for a slow client: a 40-document folder probes 40
+        # sizes, where the flat share root probed every document in the share.
+        client = self._provider._create_client(self.environ)
+        if client is not None:
+            prefetch_document_sizes(client, documents, ttl=self._provider._size_ttl)
+
+        # Same collision rule as the share root, and deliberately the same
+        # ordering (lowest id keeps the base name), so a document has the same
+        # filename in every folder it appears in.
+        index: dict[str, PaperlessDocument] = {}
+        for doc in sorted(documents, key=lambda d: d.id):
+            base_name = sanitize_filename(doc.title)
+            filename = f"{base_name}.pdf"
+            if filename in index:
+                filename = f"{base_name}_{doc.id}.pdf"
+            index[filename] = doc
+
+        self._doc_by_filename = index
+        return index
+
+    def get_member_names(self) -> list[str]:
+        """Return the filenames in this folder."""
+        return list(self._get_documents().keys())
+
+    def get_member(self, name: str) -> DocumentResource | MacOSMetadataResource | None:
+        """Get a document in this folder by filename."""
+        if is_macos_metadata_file(name):
+            return MacOSMetadataResource(f"{self.path}/{name}", self.environ)
+
+        doc = self._get_documents().get(name)
+        if doc is None:
+            return None
+        return DocumentResource(
+            f"{self.path}/{name}",
+            self.environ,
+            self._provider,
+            doc,
+            share=self._share,
+        )
+
+    def create_collection(self, name: str) -> None:
+        """Reject directory creation -- folders mirror tags, not the reverse."""
+        from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN  # type: ignore[import-untyped]
+
+        raise DAVError(HTTP_FORBIDDEN, f"Cannot create folders inside a tag folder: {name}")
+
+    def create_empty_resource(self, name: str) -> MacOSMetadataResource:
+        """Reject file creation; documents enter through Paperless, not here.
+
+        macOS sidecar files are the one exception, matching the share root and
+        done folder -- Finder creates them unprompted and refusing breaks it.
+        """
+        if is_macos_metadata_file(name):
+            return MacOSMetadataResource(f"{self.path}/{name}", self.environ)
+
+        from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN  # type: ignore[import-untyped]
+
+        raise DAVError(HTTP_FORBIDDEN, f"Cannot create files in a tag folder: {name}")
 
 
 class DocumentResource(DAVNonCollection):  # type: ignore[misc]

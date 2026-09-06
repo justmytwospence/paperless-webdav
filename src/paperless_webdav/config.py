@@ -60,6 +60,20 @@ class Settings(BaseSettings):
             "skips the in-memory content cache."
         ),
     )
+    webdav_tag_folders: bool = Field(
+        default=False,
+        description=(
+            "Serve each share as a set of folders, one per tag, instead of a flat "
+            "list of every document. A document appears in the folder of every tag "
+            "it carries, which a virtual filesystem allows and Paperless's "
+            "many-to-many tags require; documents whose only tags are the share's "
+            "own include_tags land in 'unsorted'. Tags stay the source of truth -- "
+            "a folder is a live tag query, nothing is written back, and turning "
+            "this off restores the flat listing with no state to unwind. Folders "
+            "are derived automatically, so a tag added or renamed in Paperless "
+            "shows up as a folder with no configuration here."
+        ),
+    )
     webdav_document_list_ttl: int = Field(
         default=0,
         description=(

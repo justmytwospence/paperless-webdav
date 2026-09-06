@@ -228,6 +228,7 @@ def create_webdav_app(
     stream_downloads: bool = False,
     document_list_ttl: int = 0,
     size_ttl: int = 300,
+    tag_folders: bool = False,
 ) -> WsgiDAVApp:
     """Create the wsgidav WSGI application.
 
@@ -254,6 +255,7 @@ def create_webdav_app(
         stream_downloads=stream_downloads,
         document_list_ttl=document_list_ttl,
         size_ttl=size_ttl,
+        tag_folders=tag_folders,
     )
 
     # Create authenticator class that captures our configuration
@@ -352,6 +354,7 @@ class WebDAVServer:
         stream_downloads: bool = False,
         document_list_ttl: int = 0,
         size_ttl: int = 300,
+        tag_folders: bool = False,
     ) -> None:
         """Initialize the WebDAV server.
 
@@ -387,6 +390,7 @@ class WebDAVServer:
             stream_downloads=stream_downloads,
             document_list_ttl=document_list_ttl,
             size_ttl=size_ttl,
+            tag_folders=tag_folders,
         )
         self._server = cheroot.wsgi.Server(
             (host, port),
