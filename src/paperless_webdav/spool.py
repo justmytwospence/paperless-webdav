@@ -463,9 +463,28 @@ def attribute_source(
 
     Returns:
         (document_id or None, confidence) where confidence is
-        "size" | "ambiguous" | "weak" | "none". Only "size" is safe to act on
-        without review; everything else must be routed for human attention
-        rather than silently attached to a document.
+        "size" | "conflict" | "ambiguous" | "weak" | "none". Only "size" is safe
+        to act on without review; everything else must be routed for human
+        attention rather than silently attached to a document.
+
+    A note on why "size" now also requires the path to agree. On 2026-09-06 a
+    Boox uploaded 8,200,062 bytes of annotated doc 722 (stored 7,108,617). The
+    annotation layer was 1,091,445 bytes -- 42,869 past the 1 MB floor -- so the
+    TRUE source was excluded, while unrelated doc 698 ("Bayesian workflow",
+    stored 8,040,622) sat 159,440 away and won outright. The runner-up was
+    310 KB back, well outside AMBIGUOUS_DELTA_WINDOW, so this returned "size":
+    full confidence, wrong document, no warning. Six documents in that share
+    were inside the window and the real one was not among them.
+
+    Raising the tolerance does not fix this -- widen it enough to admit 722 and
+    698 still wins, because it is genuinely closer in size. Size cannot order
+    these correctly at any threshold. What distinguishes them is content: an
+    annotating reader appends, so md5(upload[:stored_size]) equals the source's
+    checksum exactly (verified true for 722, false for 698 on that live file).
+    This function does not have the bytes or the checksums, so it cannot do
+    that test; bin/paperless-annotation-ingest in the homelab repo does it at
+    ingest time. What this function can do is stop claiming certainty when its
+    one signal is contradicted by the client's own statement of what it wrote.
     """
     # An annotation layer is kilobytes to a few megabytes -- it is not a
     # percentage of the file. A purely proportional tolerance grows with file
@@ -498,6 +517,28 @@ def attribute_source(
                 runner_up_delta=within[1][0],
             )
             return best_id, "ambiguous"
+        # The client told us which resource it PUT to. When that contradicts the
+        # size winner, one of the two signals is wrong and nothing here can say
+        # which -- unless the delta is small enough to be unmistakably a single
+        # appended annotation layer rather than a coincidence of file sizes.
+        # That is the line between the two incidents: 721 won by 3,538 bytes (an
+        # append, correct against a lying path); 698 won by 159,440 (a
+        # coincidence, wrong against a truthful path). At or below the window,
+        # size stays authoritative; above it, defer to the client's own
+        # statement and route for review instead of claiming certainty.
+        if (
+            path_document_id is not None
+            and path_document_id != best_id
+            and best_delta > AMBIGUOUS_DELTA_WINDOW
+        ):
+            logger.warning(
+                "spool_attribution_conflict",
+                upload_size=upload_size,
+                path_document_id=path_document_id,
+                size_document_id=best_id,
+                size_delta=best_delta,
+            )
+            return path_document_id, "conflict"
         return best_id, "size"
 
     if path_document_id is not None:

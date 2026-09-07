@@ -161,6 +161,50 @@ class TestAttributeSource:
         assert doc_id == 721
         assert confidence == "size"
 
+    def test_replays_the_second_real_incident(self) -> None:
+        """2026-09-06: 8,200,062 bytes arrived on doc 722's path -- correctly.
+
+        The bytes really were doc 722 (stored 7,108,617) plus a 1,091,445-byte
+        Boox annotation layer, proven by md5(upload[:7_108_617]) matching 722's
+        checksum exactly. But that layer is 42,869 bytes past the 1 MB floor, so
+        the true source was excluded outright, and unrelated doc 698 ("Bayesian
+        workflow", stored 8,040,622) sat 159,440 away and won. The runner-up was
+        310 KB back, outside AMBIGUOUS_DELTA_WINDOW, so this used to return
+        (698, "size") -- full confidence, wrong paper, no warning.
+
+        Widening the tolerance cannot fix it: admit 722 and 698 still wins, being
+        genuinely closer in size. Only the disagreement with the path is a signal.
+        """
+        doc_id, confidence = attribute_source(
+            8_200_062,
+            {698: 8_040_622, 722: 7_108_617, 87: 7_730_105, 149: 7_598_141},
+            path_document_id=722,
+        )
+        assert doc_id == 722
+        assert confidence == "conflict"
+
+    def test_a_tiny_delta_still_outranks_a_lying_path(self) -> None:
+        """The 721 incident must keep working: an append is real evidence.
+
+        3,538 bytes is unmistakably one appended annotation layer, so size stays
+        authoritative even though the path disagrees. 159,440 (the 698 case) is
+        not, and defers to the path. AMBIGUOUS_DELTA_WINDOW is that line.
+        """
+        doc_id, confidence = attribute_source(
+            52_421_533,
+            {698: 8_040_622, 721: 52_417_995},
+            path_document_id=698,
+        )
+        assert doc_id == 721
+        assert confidence == "size"
+
+    def test_agreement_between_path_and_size_is_still_confident(self) -> None:
+        doc_id, confidence = attribute_source(
+            8_200_062, {722: 8_190_000}, path_document_id=722
+        )
+        assert doc_id == 722
+        assert confidence == "size"
+
     def test_falls_back_to_path_and_flags_it_weak(self) -> None:
         doc_id, confidence = attribute_source(999, {698: 8_040_622}, path_document_id=698)
         assert doc_id == 698
