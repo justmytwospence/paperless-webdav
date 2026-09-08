@@ -144,6 +144,14 @@ class PaperlessClient:
         self._headers = {
             "Authorization": f"Token {token}",
             "Content-Type": "application/json",
+            # Pin the REST API version. Paperless-ngx 3.x removes v1-v8 and moves
+            # DEFAULT_VERSION from 9 to 10, so an unversioned client silently
+            # changes semantics the moment the server is upgraded -- including on
+            # /documents/ and /tasks/, whose serialisers differ between 9 and 10.
+            # Sending this is a no-op against 2.20.15 (verified: no header -> 200,
+            # version=9 -> 200, version=10 -> 406) and turns the server upgrade
+            # into a separate, deliberate migration instead of a silent flip.
+            "Accept": "application/json; version=9",
         }
 
     async def _request(
@@ -319,11 +327,16 @@ class PaperlessClient:
             params=params,
         )
 
+        # original_file_name is the one field here that is neither a primary
+        # attribute nor guaranteed by the sparse fieldset above, and a bare
+        # subscript on it fails the WHOLE listing rather than one file -- the
+        # KeyError propagates out of _paginated_get and the share 500s. Fall
+        # back to the title, which is what the provider names files by anyway.
         documents = [
             PaperlessDocument(
                 id=doc["id"],
                 title=doc["title"],
-                original_file_name=doc["original_file_name"],
+                original_file_name=doc.get("original_file_name") or doc["title"],
                 created=doc["created"],
                 modified=doc["modified"],
                 tags=doc["tags"],
