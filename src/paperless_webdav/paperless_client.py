@@ -41,6 +41,11 @@ class PaperlessDocument:
     created: str
     modified: str
     tags: list[int]
+    # When the document entered Paperless. Unlike `created` (the document's own
+    # date, e.g. a paper's publication date) and `modified` (bumped by any tag
+    # edit), this never changes, so it is what "recently added" sorts on.
+    # Defaulted so document lists cached before the field existed still load.
+    added: str = ""
 
 
 class _PaperlessDocumentStream:
@@ -313,7 +318,7 @@ class PaperlessClient:
         # Shares larger than 200 docs still paginate.
         params: dict[str, Any] = {
             "page_size": 200,
-            "fields": "id,title,original_file_name,created,modified,tags",
+            "fields": "id,title,original_file_name,created,modified,tags,added",
         }
 
         if include_tag_ids:
@@ -340,6 +345,7 @@ class PaperlessClient:
                 created=doc["created"],
                 modified=doc["modified"],
                 tags=doc["tags"],
+                added=doc.get("added") or "",
             )
             for doc in results
         ]

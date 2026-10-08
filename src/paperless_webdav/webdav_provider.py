@@ -213,6 +213,13 @@ UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
 # self-empties: tag a document and it moves to that tag's folder.
 UNSORTED_FOLDER_NAME = "unsorted"
 
+# Every document in the share, newest first, in tag-folder mode. Folders hide
+# the one view a reader wants daily -- "what did I just add?" -- because a
+# document only shows up under its tags. Names carry the date added as a
+# prefix so sorting by name IS sorting by date: the reader's sort options are
+# not ours to rely on, but every client can sort by name.
+ALL_FOLDER_NAME = "all"
+
 # macOS metadata file patterns
 MACOS_METADATA_PATTERNS = (
     ".DS_Store",
@@ -857,7 +864,10 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
         if client is None:
             return {}
 
+        # Reserved folder names win over a tag of the same name; that tag's
+        # documents stay reachable through "all".
         excluded = {name.lower() for name in self._share.include_tags}
+        excluded.update({ALL_FOLDER_NAME, UNSORTED_FOLDER_NAME})
         if self._share.done_folder_enabled and self._share.done_tag:
             excluded.add(self._share.done_tag.lower())
 
@@ -946,6 +956,7 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
         # so nothing is hidden, the root just goes from hundreds of entries to
         # a dozen.
         if self._provider._tag_folders:
+            members.append(ALL_FOLDER_NAME)
             members.extend(sorted(self._topic_tag_ids()))
             if self._untagged_documents():
                 members.append(UNSORTED_FOLDER_NAME)
@@ -997,6 +1008,10 @@ class ShareResource(DAVCollection):  # type: ignore[misc]
 
         # Check for a tag folder (or the unsorted catch-all)
         if self._provider._tag_folders:
+            if name == ALL_FOLDER_NAME:
+                return AllDocumentsFolderResource(
+                    f"{self.path}/{name}", self.environ, self._provider, self._share, tag_id=None
+                )
             if name == UNSORTED_FOLDER_NAME:
                 return TagFolderResource(
                     f"{self.path}/{name}", self.environ, self._provider, self._share, tag_id=None
@@ -1363,15 +1378,7 @@ class TagFolderResource(DAVCollection):  # type: ignore[misc]
         if self._doc_by_filename is not None:
             return self._doc_by_filename
 
-        share_resource = self._share_resource()
-        if self._tag_id is None:
-            documents = share_resource._untagged_documents()
-        else:
-            documents = [
-                doc
-                for doc in share_resource._get_documents(prefetch_sizes=False)
-                if self._tag_id in doc.tags
-            ]
+        documents = self._select_documents(self._share_resource())
 
         # Size probes are scoped to this folder's members. That is the whole
         # point of folders for a slow client: a 40-document folder probes 40
@@ -1380,6 +1387,21 @@ class TagFolderResource(DAVCollection):  # type: ignore[misc]
         if client is not None:
             prefetch_document_sizes(client, documents, ttl=self._provider._size_ttl)
 
+        self._doc_by_filename = self._index_documents(documents)
+        return self._doc_by_filename
+
+    def _select_documents(self, share_resource: ShareResource) -> list[PaperlessDocument]:
+        """The share's documents that belong in this folder."""
+        if self._tag_id is None:
+            return share_resource._untagged_documents()
+        return [
+            doc
+            for doc in share_resource._get_documents(prefetch_sizes=False)
+            if self._tag_id in doc.tags
+        ]
+
+    def _index_documents(self, documents: list[PaperlessDocument]) -> dict[str, PaperlessDocument]:
+        """Filename -> document, in listing order."""
         # Same collision rule as the share root, and deliberately the same
         # ordering (lowest id keeps the base name), so a document has the same
         # filename in every folder it appears in.
@@ -1390,9 +1412,16 @@ class TagFolderResource(DAVCollection):  # type: ignore[misc]
             if filename in index:
                 filename = f"{base_name}_{doc.id}.pdf"
             index[filename] = doc
-
-        self._doc_by_filename = index
         return index
+
+    def _document_resource(self, name: str, doc: PaperlessDocument) -> DocumentResource:
+        return DocumentResource(
+            f"{self.path}/{name}",
+            self.environ,
+            self._provider,
+            doc,
+            share=self._share,
+        )
 
     def get_member_names(self) -> list[str]:
         """Return the filenames in this folder."""
@@ -1406,13 +1435,7 @@ class TagFolderResource(DAVCollection):  # type: ignore[misc]
         doc = self._get_documents().get(name)
         if doc is None:
             return None
-        return DocumentResource(
-            f"{self.path}/{name}",
-            self.environ,
-            self._provider,
-            doc,
-            share=self._share,
-        )
+        return self._document_resource(name, doc)
 
     def create_collection(self, name: str) -> None:
         """Reject directory creation -- folders mirror tags, not the reverse."""
@@ -1434,6 +1457,65 @@ class TagFolderResource(DAVCollection):  # type: ignore[misc]
         raise DAVError(HTTP_FORBIDDEN, f"Cannot create files in a tag folder: {name}")
 
 
+class AllDocumentsFolderResource(TagFolderResource):
+    """Every document in the share, newest addition first.
+
+    Tag folders answer "what do I have on X"; this answers "what did I just
+    add", which no tag folder can. Files are named "YYYY-MM-DD Title.pdf" by
+    the date the document entered Paperless, so a name sort is a date sort on
+    any client. They are also listed newest first, and report that date as
+    their last-modified time, so a client that keeps server order or sorts by
+    date agrees.
+
+    The names differ from the same document's name in a tag folder. That is
+    no different from a document appearing under two tags: a separate path to
+    the reader, the same document here. Write-back attributes uploads by
+    checksum, not by path, so annotating a copy opened from here is safe.
+    """
+
+    def _select_documents(self, share_resource: ShareResource) -> list[PaperlessDocument]:
+        return list(share_resource._get_documents(prefetch_sizes=False))
+
+    def _index_documents(self, documents: list[PaperlessDocument]) -> dict[str, PaperlessDocument]:
+        # Collisions are resolved oldest-id-first, as everywhere else, so a
+        # name never moves to another document; the listing order is applied
+        # afterwards.
+        index: dict[str, PaperlessDocument] = {}
+        for doc in sorted(documents, key=lambda d: d.id):
+            base_name = f"{_added_date(doc)} {sanitize_filename(doc.title)}"
+            filename = f"{base_name}.pdf"
+            if filename in index:
+                filename = f"{base_name}_{doc.id}.pdf"
+            index[filename] = doc
+        newest_first = sorted(
+            index.items(),
+            key=lambda item: (item[1].added or item[1].created, item[1].id),
+            reverse=True,
+        )
+        return dict(newest_first)
+
+    def _document_resource(self, name: str, doc: PaperlessDocument) -> DocumentResource:
+        return DocumentResource(
+            f"{self.path}/{name}",
+            self.environ,
+            self._provider,
+            doc,
+            share=self._share,
+            display_name=name,
+            last_modified_is_added=True,
+        )
+
+
+def _added_date(doc: PaperlessDocument) -> str:
+    """YYYY-MM-DD the document was added, in Paperless's own time zone.
+
+    The ISO string already carries Paperless's offset, so its date part is the
+    local date; parsing to UTC first would move late-evening additions to the
+    next day. Falls back to `created` for a cached list that predates `added`.
+    """
+    return (doc.added or doc.created)[:10]
+
+
 class DocumentResource(DAVNonCollection):  # type: ignore[misc]
     """WebDAV resource representing a Paperless document.
 
@@ -1449,6 +1531,8 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         document: PaperlessDocument,
         share: Share | None = None,
         in_done_folder: bool = False,
+        display_name: str | None = None,
+        last_modified_is_added: bool = False,
     ) -> None:
         """Initialize the document resource.
 
@@ -1459,12 +1543,18 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
             document: The PaperlessDocument metadata
             share: Optional Share configuration (needed for move operations)
             in_done_folder: Whether this document is located in the done folder
+            display_name: Name to report instead of "{title}.pdf", for folders
+                that name files differently (the "all" folder's date prefix)
+            last_modified_is_added: Report the date the document was added as
+                its last-modified time, so a date sort means "recently added"
         """
         super().__init__(path, environ)
         self._provider = provider
         self.document = document
         self._share: Share | None = share
         self._in_done_folder: bool = in_done_folder
+        self._display_name: str | None = display_name
+        self._last_modified_is_added: bool = last_modified_is_added
         # Cache for downloaded content
         self._content: bytes | None = None
         # Cache for file size (from HEAD request)
@@ -1478,6 +1568,8 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         Returns:
             Sanitized document title with .pdf extension
         """
+        if self._display_name is not None:
+            return self._display_name
         return f"{sanitize_filename(self.document.title)}.pdf"
 
     def get_content_type(self) -> str:
@@ -1675,8 +1767,11 @@ class DocumentResource(DAVNonCollection):  # type: ignore[misc]
         """Return the document modification date as Unix timestamp.
 
         Returns:
-            The document's modified timestamp as seconds since epoch
+            The document's modified timestamp as seconds since epoch, or
+            its added timestamp where the folder asked for that
         """
+        if self._last_modified_is_added and self.document.added:
+            return self._parse_iso_datetime(self.document.added).timestamp()
         dt = self._parse_iso_datetime(self.document.modified)
         return dt.timestamp()
 
