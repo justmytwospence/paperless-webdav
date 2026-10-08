@@ -109,9 +109,7 @@ class Settings(BaseSettings):
             "a folder is a live tag query, nothing is written back, and turning "
             "this off restores the flat listing with no state to unwind. Folders "
             "are derived automatically, so a tag added or renamed in Paperless "
-            "shows up as a folder with no configuration here. An 'all' folder "
-            "alongside them lists every document newest first, named "
-            "'YYYY-MM-DD Title.pdf' by the date it was added."
+            "shows up as a folder with no configuration here."
         ),
     )
     opds_enabled: bool = Field(

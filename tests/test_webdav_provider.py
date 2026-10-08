@@ -12,9 +12,7 @@ from paperless_webdav.cache import get_cache
 from paperless_webdav.paperless_client import PaperlessDocument, PaperlessTag
 from paperless_webdav.webdav_provider import (
     SIZE_PROBE_CHUNK,
-    ALL_FOLDER_NAME,
     UNSORTED_FOLDER_NAME,
-    AllDocumentsFolderResource,
     DocumentResource,
     DoneFolderResource,
     PaperlessProvider,
@@ -3184,7 +3182,7 @@ class TestTagFolders:
 
         # the share's own tag is not a folder -- every document carries it
         assert "academic" not in names
-        assert set(names) == {ALL_FOLDER_NAME, "bayesian", "philosophy", UNSORTED_FOLDER_NAME}
+        assert set(names) == {"bayesian", "philosophy", UNSORTED_FOLDER_NAME}
         assert not [n for n in names if n.endswith(".pdf")]
 
     def test_document_appears_in_every_matching_folder(
@@ -3217,70 +3215,6 @@ class TestTagFolders:
             assert "Priors.pdf" in bayesian.get_member_names()
             # only the document with no topic tag
             assert unsorted.get_member_names() == ["Loose.pdf"]
-
-    def test_all_folder_lists_every_document_newest_first(
-        self, mock_environ_with_token: dict[str, Any]
-    ) -> None:
-        """'all' holds the whole share, date-prefixed by when each was added."""
-        mock_share = self._share()
-        provider = self._provider(mock_share)
-
-        def doc(doc_id: int, title: str, added: str) -> PaperlessDocument:
-            return PaperlessDocument(
-                id=doc_id,
-                title=title,
-                original_file_name=f"{title}.pdf",
-                # created is the paper's own date and must not drive the order
-                created="1999-01-01T00:00:00Z",
-                modified="2026-10-01T00:00:00Z",
-                tags=[1, 2],
-                added=added,
-            )
-
-        docs = [
-            doc(1, "Old", "2026-01-02T09:00:00-06:00"),
-            doc(2, "New", "2026-10-08T23:30:00-06:00"),
-            doc(3, "Middle", "2026-05-05T12:00:00-06:00"),
-        ]
-
-        with (
-            patch.object(ShareResource, "_load_documents", return_value=docs),
-            patch.object(
-                ShareResource,
-                "_get_tag_map",
-                return_value={"academic": 1, "philosophy": 2, "bayesian": 3},
-            ),
-            patch.object(provider, "_create_client", return_value=MagicMock()),
-        ):
-            share_resource = ShareResource(
-                "/academic", mock_environ_with_token, provider, mock_share
-            )
-            folder = share_resource.get_member(ALL_FOLDER_NAME)
-            assert isinstance(folder, AllDocumentsFolderResource)
-            names = folder.get_member_names()
-            # local date from the stored offset, not shifted to UTC
-            assert names == [
-                "2026-10-08 New.pdf",
-                "2026-05-05 Middle.pdf",
-                "2026-01-02 Old.pdf",
-            ]
-            member = folder.get_member("2026-10-08 New.pdf")
-            assert isinstance(member, DocumentResource)
-            assert member.document.id == 2
-            assert member.get_display_name() == "2026-10-08 New.pdf"
-            assert (
-                member.get_last_modified()
-                == member._parse_iso_datetime("2026-10-08T23:30:00-06:00").timestamp()
-            )
-
-            # the same document keeps its plain name and modified time elsewhere
-            philosophy = share_resource.get_member("philosophy")
-            plain = philosophy.get_member("New.pdf")
-            assert plain.get_display_name() == "New.pdf"
-            assert (
-                plain.get_last_modified()
-                == plain._parse_iso_datetime("2026-10-01T00:00:00Z").timestamp()
-            )
 
     def test_disabled_keeps_flat_listing(self, mock_environ_with_token: dict[str, Any]) -> None:
         """With the flag off the share root is unchanged."""
