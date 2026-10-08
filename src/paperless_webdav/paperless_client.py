@@ -48,6 +48,30 @@ class PaperlessDocument:
     added: str = ""
 
 
+# The sparse fieldset every document listing asks for: exactly what
+# PaperlessDocument holds, and none of the OCR `content`.
+DOCUMENT_FIELDS = "id,title,original_file_name,created,modified,tags,added"
+
+
+def _document_from_api(doc: dict[str, Any]) -> PaperlessDocument:
+    """Build a PaperlessDocument from one /api/documents/ result.
+
+    original_file_name is the one field that is neither a primary attribute
+    nor guaranteed by the sparse fieldset, and a bare subscript on it fails
+    the WHOLE listing rather than one file. Fall back to the title, which is
+    what files are named by anyway.
+    """
+    return PaperlessDocument(
+        id=doc["id"],
+        title=doc["title"],
+        original_file_name=doc.get("original_file_name") or doc["title"],
+        created=doc["created"],
+        modified=doc["modified"],
+        tags=doc["tags"],
+        added=doc.get("added") or "",
+    )
+
+
 class _PaperlessDocumentStream:
     """Sync file-like wrapping an httpx streaming response.
 
@@ -109,6 +133,11 @@ class _PaperlessDocumentStream:
 
     def tell(self) -> int:
         return self._position
+
+    @property
+    def headers(self) -> httpx.Headers:
+        """Upstream response headers (Content-Type, Content-Length, ...)."""
+        return self._response.headers
 
     def close(self) -> None:
         if self._closed:
@@ -318,7 +347,7 @@ class PaperlessClient:
         # Shares larger than 200 docs still paginate.
         params: dict[str, Any] = {
             "page_size": 200,
-            "fields": "id,title,original_file_name,created,modified,tags,added",
+            "fields": DOCUMENT_FIELDS,
         }
 
         if include_tag_ids:
@@ -332,23 +361,7 @@ class PaperlessClient:
             params=params,
         )
 
-        # original_file_name is the one field here that is neither a primary
-        # attribute nor guaranteed by the sparse fieldset above, and a bare
-        # subscript on it fails the WHOLE listing rather than one file -- the
-        # KeyError propagates out of _paginated_get and the share 500s. Fall
-        # back to the title, which is what the provider names files by anyway.
-        documents = [
-            PaperlessDocument(
-                id=doc["id"],
-                title=doc["title"],
-                original_file_name=doc.get("original_file_name") or doc["title"],
-                created=doc["created"],
-                modified=doc["modified"],
-                tags=doc["tags"],
-                added=doc.get("added") or "",
-            )
-            for doc in results
-        ]
+        documents = [_document_from_api(doc) for doc in results]
         logger.debug(
             "fetched_documents",
             count=len(documents),
@@ -394,7 +407,15 @@ class PaperlessClient:
         WebDAV clients with idle timeouts (e.g. Boox / okhttp on Android)
         to abort the request before the body started arriving.
         """
-        url = f"{self.base_url}/api/documents/{document_id}/download/"
+        return self.open_stream(f"/api/documents/{document_id}/download/")
+
+    def open_stream(self, endpoint: str) -> _PaperlessDocumentStream:
+        """Open a streaming GET of any binary endpoint (download, thumb).
+
+        The returned stream also exposes the upstream response headers, so a
+        caller can pass Content-Type and Content-Length through.
+        """
+        url = f"{self.base_url}{endpoint}"
         timeout = httpx.Timeout(30.0, read=300.0)
         client = httpx.Client(timeout=timeout)
         try:
@@ -404,8 +425,42 @@ class PaperlessClient:
         except Exception:
             client.close()
             raise
-        logger.debug("streaming_document_started", document_id=document_id)
+        logger.debug("streaming_started", endpoint=endpoint)
         return _PaperlessDocumentStream(response=response, client=client)
+
+    async def search_documents(
+        self,
+        query: str,
+        include_tag_ids: list[int] | None = None,
+        exclude_tag_ids: list[int] | None = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> tuple[list[PaperlessDocument], int]:
+        """Full-text search, one page of results in Paperless's relevance order.
+
+        Returns:
+            (documents on this page, total number of hits). A page past the
+            end is an empty list rather than an error -- Paperless answers it
+            with 404.
+        """
+        params: dict[str, Any] = {
+            "query": query,
+            "page": page,
+            "page_size": page_size,
+            "fields": DOCUMENT_FIELDS,
+        }
+        if include_tag_ids:
+            params["tags__id__all"] = ",".join(str(tid) for tid in include_tag_ids)
+        if exclude_tag_ids:
+            params["tags__id__none"] = ",".join(str(tid) for tid in exclude_tag_ids)
+
+        response = await self._request("GET", "/api/documents/", params=params)
+        if response.status_code == 404:
+            return [], 0
+        response.raise_for_status()
+        data = response.json()
+        documents = [_document_from_api(doc) for doc in data.get("results", [])]
+        return documents, int(data.get("count", len(documents)))
 
     @staticmethod
     def _served_size_from_metadata(metadata: dict[str, Any]) -> int | None:

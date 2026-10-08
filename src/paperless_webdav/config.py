@@ -114,6 +114,15 @@ class Settings(BaseSettings):
             "'YYYY-MM-DD Title.pdf' by the date it was added."
         ),
     )
+    opds_enabled: bool = Field(
+        default=False,
+        description=(
+            "Serve an OPDS 1.2 catalog of every share under /opds on the WebDAV "
+            "port: Recently added, one feed per tag, Unsorted, and Paperless "
+            "full-text search, all newest first with one download link per "
+            "document. Same Basic auth and share membership as WebDAV."
+        ),
+    )
     webdav_document_list_ttl: int = Field(
         default=0,
         description=(

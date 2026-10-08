@@ -235,7 +235,8 @@ def create_webdav_app(
     spool_max_bytes: int = 5 * 1024 * 1024 * 1024,
     annotation_tag: str = "zz-annotated-copy",
     spool_retain_days: int = 7,
-) -> WsgiDAVApp:
+    opds_enabled: bool = False,
+) -> Any:
     """Create the wsgidav WSGI application.
 
     Args:
@@ -341,7 +342,16 @@ def create_webdav_app(
 
     app = WsgiDAVApp(config)
     # Wrap with no-cache middleware to prevent macOS Finder caching issues
-    return NoCacheMiddleware(app)
+    dav_app = NoCacheMiddleware(app)
+    if not opds_enabled:
+        return dav_app
+
+    # The OPDS catalog shares this port, provider and Basic-auth check; it
+    # only takes over paths under /opds.
+    from paperless_webdav.opds import OpdsApp, OpdsDispatcher
+
+    logger.info("opds_catalog_enabled")
+    return OpdsDispatcher(OpdsApp(provider, AuthenticatorClass(None, {})), dav_app)
 
 
 class WebDAVServer:
@@ -373,6 +383,7 @@ class WebDAVServer:
         spool_max_bytes: int = 5 * 1024 * 1024 * 1024,
         annotation_tag: str = "zz-annotated-copy",
         spool_retain_days: int = 7,
+        opds_enabled: bool = False,
     ) -> None:
         """Initialize the WebDAV server.
 
@@ -415,6 +426,7 @@ class WebDAVServer:
             spool_max_bytes=spool_max_bytes,
             annotation_tag=annotation_tag,
             spool_retain_days=spool_retain_days,
+            opds_enabled=opds_enabled,
         )
         self._server = cheroot.wsgi.Server(
             (host, port),
