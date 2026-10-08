@@ -111,6 +111,7 @@ def run_servers() -> None:
         max_upload_bytes=settings.webdav_max_upload_bytes,
         spool_max_bytes=settings.webdav_spool_max_bytes,
         spool_retain_days=settings.webdav_spool_retain_days,
+        opds_enabled=settings.opds_enabled,
     )
 
     # Run WebDAV server in background thread

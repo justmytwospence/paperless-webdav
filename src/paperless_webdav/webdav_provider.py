@@ -213,6 +213,7 @@ UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
 # self-empties: tag a document and it moves to that tag's folder.
 UNSORTED_FOLDER_NAME = "unsorted"
 
+
 # macOS metadata file patterns
 MACOS_METADATA_PATTERNS = (
     ".DS_Store",
@@ -1363,15 +1364,7 @@ class TagFolderResource(DAVCollection):  # type: ignore[misc]
         if self._doc_by_filename is not None:
             return self._doc_by_filename
 
-        share_resource = self._share_resource()
-        if self._tag_id is None:
-            documents = share_resource._untagged_documents()
-        else:
-            documents = [
-                doc
-                for doc in share_resource._get_documents(prefetch_sizes=False)
-                if self._tag_id in doc.tags
-            ]
+        documents = self._select_documents(self._share_resource())
 
         # Size probes are scoped to this folder's members. That is the whole
         # point of folders for a slow client: a 40-document folder probes 40
@@ -1380,6 +1373,21 @@ class TagFolderResource(DAVCollection):  # type: ignore[misc]
         if client is not None:
             prefetch_document_sizes(client, documents, ttl=self._provider._size_ttl)
 
+        self._doc_by_filename = self._index_documents(documents)
+        return self._doc_by_filename
+
+    def _select_documents(self, share_resource: ShareResource) -> list[PaperlessDocument]:
+        """The share's documents that belong in this folder."""
+        if self._tag_id is None:
+            return share_resource._untagged_documents()
+        return [
+            doc
+            for doc in share_resource._get_documents(prefetch_sizes=False)
+            if self._tag_id in doc.tags
+        ]
+
+    def _index_documents(self, documents: list[PaperlessDocument]) -> dict[str, PaperlessDocument]:
+        """Filename -> document, in listing order."""
         # Same collision rule as the share root, and deliberately the same
         # ordering (lowest id keeps the base name), so a document has the same
         # filename in every folder it appears in.
@@ -1390,9 +1398,16 @@ class TagFolderResource(DAVCollection):  # type: ignore[misc]
             if filename in index:
                 filename = f"{base_name}_{doc.id}.pdf"
             index[filename] = doc
-
-        self._doc_by_filename = index
         return index
+
+    def _document_resource(self, name: str, doc: PaperlessDocument) -> DocumentResource:
+        return DocumentResource(
+            f"{self.path}/{name}",
+            self.environ,
+            self._provider,
+            doc,
+            share=self._share,
+        )
 
     def get_member_names(self) -> list[str]:
         """Return the filenames in this folder."""
@@ -1406,13 +1421,7 @@ class TagFolderResource(DAVCollection):  # type: ignore[misc]
         doc = self._get_documents().get(name)
         if doc is None:
             return None
-        return DocumentResource(
-            f"{self.path}/{name}",
-            self.environ,
-            self._provider,
-            doc,
-            share=self._share,
-        )
+        return self._document_resource(name, doc)
 
     def create_collection(self, name: str) -> None:
         """Reject directory creation -- folders mirror tags, not the reverse."""
