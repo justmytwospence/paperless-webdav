@@ -13,6 +13,7 @@ from paperless_webdav.paperless_client import PaperlessDocument
 from paperless_webdav.webdav_provider import PaperlessProvider, ShareResource
 
 ATOM = "{http://www.w3.org/2005/Atom}"
+ORIGIN = "https://paperless.example"
 TAGS = {"academic": 1, "philosophy": 2, "bayesian": 3, "paperwork": 9}
 
 
@@ -88,6 +89,8 @@ def _get(
         "REQUEST_METHOD": method,
         "PATH_INFO": path,
         "QUERY_STRING": query,
+        "HTTP_X_FORWARDED_PROTO": "https",
+        "HTTP_X_FORWARDED_HOST": "paperless.example",
     }
     if auth:
         environ["HTTP_AUTHORIZATION"] = "Basic " + base64.b64encode(b"me:secret").decode()
@@ -107,7 +110,9 @@ def _titles(body: bytes) -> list[str]:
 def _link(element: ET.Element, rel: str) -> str | None:
     for link in element.findall(f"{ATOM}link"):
         if link.get("rel") == rel:
-            return link.get("href")
+            href = link.get("href") or ""
+            assert href.startswith(ORIGIN), href
+            return href[len(ORIGIN) :]
     return None
 
 

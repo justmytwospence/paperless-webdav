@@ -194,7 +194,7 @@ class OpdsApp:
         head: bool,
     ) -> Iterable[bytes]:
         if not parts:
-            return self._xml(start_response, self._root_feed(), NAV_TYPE, head)
+            return self._xml(environ, start_response, self._root_feed(), NAV_TYPE, head)
 
         share = self._provider._get_shares().get(parts[0])
         if share is None:
@@ -213,15 +213,15 @@ class OpdsApp:
             feed = self._acquisition_feed(
                 resource, "recent", resource._share.name, docs, page, path=""
             )
-            return self._xml(start_response, feed, ACQ_TYPE, head)
+            return self._xml(environ, start_response, feed, ACQ_TYPE, head)
         if rest == ["browse"]:
-            return self._xml(start_response, self._share_feed(resource), NAV_TYPE, head)
+            return self._xml(environ, start_response, self._share_feed(resource), NAV_TYPE, head)
         if rest == ["unsorted"]:
             docs = _newest_first(resource._untagged_documents())
             feed = self._acquisition_feed(
                 resource, "unsorted", "Unsorted", docs, page, path="unsorted"
             )
-            return self._xml(start_response, feed, ACQ_TYPE, head)
+            return self._xml(environ, start_response, feed, ACQ_TYPE, head)
         if len(rest) == 2 and rest[0] == "tag" and rest[1].isdigit():
             tag_id = int(rest[1])
             names = {tid: name for name, tid in resource._topic_tag_ids().items()}
@@ -233,11 +233,11 @@ class OpdsApp:
             feed = self._acquisition_feed(
                 resource, f"tag:{tag_id}", names[tag_id], docs, page, path=f"tag/{tag_id}"
             )
-            return self._xml(start_response, feed, ACQ_TYPE, head)
+            return self._xml(environ, start_response, feed, ACQ_TYPE, head)
         if rest == ["search"]:
             terms = (query.get("q") or [""])[0].strip()
             feed = self._search_feed(resource, terms, page)
-            return self._xml(start_response, feed, ACQ_TYPE, head)
+            return self._xml(environ, start_response, feed, ACQ_TYPE, head)
         if len(rest) == 3 and rest[0] == "download" and rest[1].isdigit():
             doc = self._member(resource, int(rest[1]))
             return self._download(environ, start_response, doc, head)
@@ -566,8 +566,21 @@ class OpdsApp:
         return max(1, int(raw)) if raw.isdigit() else 1
 
     def _xml(
-        self, start_response: StartResponse, feed: ET.Element, kind: str, head: bool
+        self,
+        environ: dict[str, Any],
+        start_response: StartResponse,
+        feed: ET.Element,
+        kind: str,
+        head: bool,
     ) -> Iterable[bytes]:
+        # Absolute URLs everywhere. Relative hrefs are what Atom specifies and
+        # KOReader resolves them, but simpler readers (Boox PushRead) fetched
+        # a relative-link feed successfully and then showed nothing.
+        origin = _origin(environ)
+        for link in feed.iter(_atom("link")):
+            href = link.get("href", "")
+            if href.startswith("/"):
+                link.set("href", origin + href)
         body = ET.tostring(feed, encoding="utf-8", xml_declaration=True)
         start_response(
             "200 OK",
@@ -587,6 +600,17 @@ class OpdsApp:
             [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
         )
         return [body]
+
+
+def _origin(environ: dict[str, Any]) -> str:
+    """scheme://host the client used, as reported by the reverse proxy."""
+    scheme = environ.get("HTTP_X_FORWARDED_PROTO") or environ.get("wsgi.url_scheme", "http")
+    host = (
+        environ.get("HTTP_X_FORWARDED_HOST")
+        or environ.get("HTTP_HOST")
+        or f"{environ.get('SERVER_NAME', 'localhost')}:{environ.get('SERVER_PORT', '80')}"
+    )
+    return f"{scheme.split(',')[0].strip()}://{host.split(',')[0].strip()}"
 
 
 class _StreamBody:
