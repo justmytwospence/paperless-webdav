@@ -9,9 +9,10 @@ the catalog format e-readers already speak (KOReader has a browser for it
 built in), and it fits the data instead of fighting it:
 
     /opds/                               navigation: one entry per share
-    /opds/{share}/                       navigation: Recently added, one entry
-                                         per tag, Unsorted, plus a search link
-    /opds/{share}/recent                 acquisition feed, newest first
+    /opds/{share}/                       acquisition feed of every document,
+                                         newest first, with each tag (and
+                                         Unsorted) as a facet; /recent is an alias
+    /opds/{share}/browse                 navigation: the same lists as entries
     /opds/{share}/tag/{tag_id}           acquisition feed, newest first
     /opds/{share}/unsorted               acquisition feed, newest first
     /opds/{share}/search?q=...           Paperless full-text search, by relevance
@@ -77,6 +78,7 @@ REL_NEW = "http://opds-spec.org/sort/new"
 ET.register_namespace("", ATOM_NS)
 ET.register_namespace("dc", DC_NS)
 ET.register_namespace("opds", OPDS_NS)
+ET.register_namespace("thr", "http://purl.org/syndication/thread/1.0")
 
 StartResponse = Callable[..., Any]
 
@@ -201,14 +203,19 @@ class OpdsApp:
         page = self._page(query)
         rest = parts[1:]
 
-        if not rest:
-            return self._xml(start_response, self._share_feed(resource), NAV_TYPE, head)
-        if rest == ["recent"]:
+        # The share URL itself is the newest-first list of every document,
+        # with tags as facets on it. Subscription-style clients (Boox PushRead)
+        # treat the URL they are given as the list of items, and show nothing
+        # for a navigation feed; KOReader shows the facets as filters. /recent
+        # stays as an alias for links made before this.
+        if not rest or rest == ["recent"]:
             docs = _newest_first(resource._get_documents(prefetch_sizes=False))
             feed = self._acquisition_feed(
-                resource, "recent", "Recently added", docs, page, path="recent"
+                resource, "recent", resource._share.name, docs, page, path=""
             )
             return self._xml(start_response, feed, ACQ_TYPE, head)
+        if rest == ["browse"]:
+            return self._xml(start_response, self._share_feed(resource), NAV_TYPE, head)
         if rest == ["unsorted"]:
             docs = _newest_first(resource._untagged_documents())
             feed = self._acquisition_feed(
@@ -282,7 +289,7 @@ class OpdsApp:
                 f"urn:paperless-webdav:opds:{name}",
                 name,
                 f"{OPDS_PREFIX}/{quote(name)}/",
-                NAV_TYPE,
+                ACQ_TYPE,
                 "subsection",
             )
         return feed
@@ -291,7 +298,7 @@ class OpdsApp:
         share: Share = resource._share
         base = f"{OPDS_PREFIX}/{quote(share.name)}"
         feed = self._new_feed(
-            f"urn:paperless-webdav:opds:{share.name}", share.name, f"{base}/", NAV_TYPE
+            f"urn:paperless-webdav:opds:{share.name}:browse", share.name, f"{base}/browse", NAV_TYPE
         )
         _sub(feed, _atom("link"), rel="up", href=f"{OPDS_PREFIX}/", type=NAV_TYPE)
         self._search_link(feed, base)
@@ -301,7 +308,7 @@ class OpdsApp:
             feed,
             f"urn:paperless-webdav:opds:{share.name}:recent",
             "Recently added",
-            f"{base}/recent",
+            f"{base}/",
             ACQ_TYPE,
             REL_NEW,
             summary=f"All {len(documents)} documents, newest first",
@@ -372,10 +379,12 @@ class OpdsApp:
             params = [q for q in (extra_query, f"page={p}" if p > 1 else "") if q]
             return f"{base}/{path}" + (f"?{'&'.join(params)}" if params else "")
 
+        active = f"{base}/{path}"
+
         feed = self._new_feed(
             f"urn:paperless-webdav:opds:{share.name}:{feed_key}", title, href(page), ACQ_TYPE
         )
-        _sub(feed, _atom("link"), rel="up", href=f"{base}/", type=NAV_TYPE)
+        _sub(feed, _atom("link"), rel="up", href=f"{base}/browse", type=NAV_TYPE)
         self._search_link(feed, base)
         if page > 1:
             _sub(feed, _atom("link"), rel="first", href=href(1), type=ACQ_TYPE)
@@ -384,10 +393,46 @@ class OpdsApp:
             _sub(feed, _atom("link"), rel="next", href=href(page + 1), type=ACQ_TYPE)
             _sub(feed, _atom("link"), rel="last", href=href(pages), type=ACQ_TYPE)
 
-        id_to_tag = {tid: name for name, tid in resource._topic_tag_ids().items()}
+        topic_tags = resource._topic_tag_ids()
+        self._facets(feed, resource, base, active, topic_tags)
+        id_to_tag = {tid: name for name, tid in topic_tags.items()}
         for doc in documents:
             self._document_entry(feed, base, doc, id_to_tag)
         return feed
+
+    def _facets(
+        self,
+        feed: ET.Element,
+        resource: ShareResource,
+        base: str,
+        active: str,
+        topic_tags: dict[str, int],
+    ) -> None:
+        """Tags as OPDS facets: filters on the list rather than separate feeds.
+
+        KOReader lists these under its filter menu, so one catalog URL reaches
+        every tag without adding a catalog per folder.
+        """
+        documents = resource._get_documents(prefetch_sizes=False)
+        facets = [("All, newest first", f"{base}/", len(documents))]
+        for name, tag_id in sorted(topic_tags.items()):
+            count = sum(1 for d in documents if tag_id in d.tags)
+            facets.append((name, f"{base}/tag/{tag_id}", count))
+        untagged = len(resource._untagged_documents())
+        if untagged:
+            facets.append(("Unsorted", f"{base}/unsorted", untagged))
+        for title, href, count in facets:
+            attrs = {
+                "rel": "http://opds-spec.org/facet",
+                "href": href,
+                "type": ACQ_TYPE,
+                "title": title,
+                f"{{{OPDS_NS}}}facetGroup": "Tags",
+                "{http://purl.org/syndication/thread/1.0}count": str(count),
+            }
+            if href == active:
+                attrs[f"{{{OPDS_NS}}}activeFacet"] = "true"
+            _sub(feed, _atom("link"), **attrs)
 
     def _document_entry(
         self, feed: ET.Element, base: str, doc: PaperlessDocument, id_to_tag: dict[int, str]

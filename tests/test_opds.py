@@ -135,14 +135,15 @@ class TestNavigation:
         assert "kind=navigation" in response.headers["Content-Type"]
         assert _titles(body) == ["academic"]
 
-    def test_share_lists_recent_then_tags_then_unsorted(self, app: OpdsApp) -> None:
-        _, body = _get(app, "/opds/academic/")
+    def test_browse_lists_recent_then_tags_then_unsorted(self, app: OpdsApp) -> None:
+        _, body = _get(app, "/opds/academic/browse")
         assert _titles(body) == ["Recently added", "bayesian", "philosophy", "Unsorted"]
         recent = _entries(body)[0]
-        assert _link(recent, "http://opds-spec.org/sort/new") == "/opds/academic/recent"
+        assert _link(recent, "http://opds-spec.org/sort/new") == "/opds/academic/"
         # the share's own tag is not offered as a feed
         assert "academic" not in _titles(body)
         assert _link(ET.fromstring(body), "search") == "/opds/academic/search?q={searchTerms}"
+        assert "kind=navigation" in _get(app, "/opds/academic/browse")[0].headers["Content-Type"]
 
     def test_unknown_share_is_404(self, app: OpdsApp) -> None:
         response, _ = _get(app, "/opds/paperwork/recent")
@@ -150,16 +151,41 @@ class TestNavigation:
 
 
 class TestAcquisition:
-    def test_recent_is_newest_first_and_paged(self, app: OpdsApp) -> None:
-        response, body = _get(app, "/opds/academic/recent")
+    def test_share_url_is_newest_first_and_paged(self, app: OpdsApp) -> None:
+        """The URL a subscription client is given lists documents directly."""
+        response, body = _get(app, "/opds/academic/")
         assert "kind=acquisition" in response.headers["Content-Type"]
         assert _titles(body) == ["New: Café", "Loose"]
-        assert _link(ET.fromstring(body), "next") == "/opds/academic/recent?page=2"
+        assert _link(ET.fromstring(body), "next") == "/opds/academic/?page=2"
 
-        _, body = _get(app, "/opds/academic/recent", "page=2")
+        _, body = _get(app, "/opds/academic", "page=2")
         assert _titles(body) == ["Old"]
         assert _link(ET.fromstring(body), "next") is None
-        assert _link(ET.fromstring(body), "previous") == "/opds/academic/recent"
+        assert _link(ET.fromstring(body), "previous") == "/opds/academic/"
+
+    def test_recent_is_an_alias(self, app: OpdsApp) -> None:
+        _, body = _get(app, "/opds/academic/recent")
+        assert _titles(body) == ["New: Café", "Loose"]
+
+    def test_tags_are_facets_on_every_list(self, app: OpdsApp) -> None:
+        _, body = _get(app, "/opds/academic/tag/3")
+        facets = [
+            link
+            for link in ET.fromstring(body).findall(f"{ATOM}link")
+            if link.get("rel") == "http://opds-spec.org/facet"
+        ]
+        assert [f.get("title") for f in facets] == [
+            "All, newest first",
+            "bayesian",
+            "philosophy",
+            "Unsorted",
+        ]
+        active = [
+            f.get("title")
+            for f in facets
+            if f.get("{http://opds-spec.org/2010/catalog}activeFacet")
+        ]
+        assert active == ["bayesian"]
 
     def test_one_download_link_per_document_in_every_feed(self, app: OpdsApp) -> None:
         def href(path: str) -> str | None:
@@ -168,7 +194,7 @@ class TestAcquisition:
             return _link(entry, "http://opds-spec.org/acquisition")
 
         expected = "/opds/academic/download/2/New%20Caf%C3%A9.pdf"
-        assert href("/opds/academic/recent") == expected
+        assert href("/opds/academic/") == expected
         assert href("/opds/academic/tag/3") == expected
         assert href("/opds/academic/tag/2") == expected
 
